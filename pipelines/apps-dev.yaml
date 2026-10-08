@@ -12,14 +12,18 @@ Metadata:
         - us-east-1
 
 # ---------------------------------------------------------------------------
-# THIS PIPELINE HAS NO DEPLOY STAGE YET, ON PURPOSE.
+# STAGES: Source -> Validate -> DeploySqs.
 #
-# Source -> Validate and nothing more. Pushing to develop lints every unit in
-# the repo and creates nothing. A deploy stage is added deliberately, per unit,
-# when that unit is ready - there is a commented-out template at the bottom.
+# Validate lints EVERY unit in the repo before any deploy stage runs, so a
+# broken unit fails the run before a working one has changed anything.
 #
-# A brand new pipeline that can already create things is the wrong default: the
-# first push happens before anyone has read the trigger filters.
+# ONE DEPLOY STAGE PER UNIT, ADDED DELIBERATELY. This pipeline shipped with
+# none - Source and Validate only - so that the first push after it was created
+# could not create anything before anyone had read the trigger filters. Each
+# stage is then added when its unit is ready.
+#
+# tests/selftest has no stage and should not get one: it is a manual smoke test
+# for a new repo or a new account, not something to recreate on every push.
 #
 # ---------------------------------------------------------------------------
 # NO TRUST CHANGE IS NEEDED IN THE TARGET ACCOUNT. This is worth stating,
@@ -531,10 +535,10 @@ Resources:
               RunOrder: 1
 
         # =====================================================================
-        # DEPLOY STAGES GO HERE, ONE PER UNIT, IN DEPENDENCY ORDER.
+        # DEPLOY STAGES, ONE PER UNIT, IN DEPENDENCY ORDER.
         #
-        # Copy the block below, change the stage name, the action name and the
-        # UNIT_CONFIG path. Nothing else varies.
+        # To add one: copy the block below, change the stage name, the action
+        # name and the UNIT_CONFIG path. Nothing else varies.
         #
         # ORDER MATTERS AND IS NOT CHECKED FOR YOU. A unit that reads another
         # unit's output with Fn::GetStackOutput must come AFTER it, or the
@@ -544,7 +548,7 @@ Resources:
         #
         # Every stage takes `Linted` as its input artifact, not `Source`, so a
         # deploy can only ever run on a tree that passed Validate.
-        #
+        # =====================================================================
         - Name: DeploySqs
           Actions:
             - Name: Sqs
@@ -559,11 +563,6 @@ Resources:
               InputArtifacts:
                 - Name: Linted
               RunOrder: 1
-        #
-        # tests/selftest is deliberately NOT given a stage. It is a manual
-        # smoke test for a new repo or a new account, not something to recreate
-        # on every push.
-        # =====================================================================
 
 Outputs:
 

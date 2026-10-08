@@ -143,7 +143,7 @@ def find_units():
 def stack_name_for(config_path):
     """Ask render-config.py, so the name matches what a deploy would use."""
     out = subprocess.run(
-        [sys.executable, "ci/render-config.py", config_path, "--emit", "stack-name"],
+        [sys.executable, "ci/render-config.py", config_path.replace("\\", "/"), "--emit", "stack-name"],
         capture_output=True, text=True)
     if out.returncode != 0:
         return None, out.stderr.strip()
