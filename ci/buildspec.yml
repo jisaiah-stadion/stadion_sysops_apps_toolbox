@@ -1,0 +1,347 @@
+version: 0.2
+
+# =============================================================================
+# ci/buildspec.yml — what CodeBuild runs, for every pipeline stage
+#
+# ONE buildspec and ONE CodeBuild project serve every stage. The stage decides
+# what to do by overriding two environment variables in its CodePipeline action:
+#
+#   BUILD_MODE=lint                                  the Build stage
+#   BUILD_MODE=deploy  UNIT_CONFIG=<path to config>   each Deploy stage
+#
+# WHY NOT A CODEBUILD PROJECT PER UNIT
+#   Four units today, and tiers 1-3 to come. A project per unit means editing
+#   IAM, logging and the VPC config of a dozen near-identical projects whenever
+#   anything changes. One project with per-action overrides keeps that in one
+#   place.
+#
+# WHY NOT CODEPIPELINE'S NATIVE CLOUDFORMATION ACTION
+#   It cannot run ci/render-config.py, so it cannot resolve names from
+#   ci/naming.yaml or read a unit's config/ file. Parameters would have to be
+#   restated in the pipeline definition, where they would drift from the config
+#   files that are supposed to be the source of truth.
+#
+#   Running our own script also means THE PIPELINE EXECUTES THE SAME CODE PATH
+#   YOU RUN LOCALLY. A green lint on a laptop means something because it is the
+#   same script, the same modules and the same checks.
+# =============================================================================
+
+env:
+  variables:
+    # Overridden per action. These defaults make an accidentally unconfigured
+    # action fail in the safest direction: lint everything, deploy nothing.
+    BUILD_MODE: lint
+    UNIT_CONFIG: ""
+
+    # Set by the promote pipeline's apply action to the name exported by its
+    # plan action. Empty everywhere else.
+    CHANGESET_NAME: ""
+
+    # Which configs BUILD_MODE=lint checks. Overridden per pipeline, because a
+    # pipeline should validate the files it is about to deploy.
+    #
+    # The default is the dev set, which is what the dev pipeline wants. The DR
+    # pipeline in us-west-2 overrides it with the usw2 configs - linting
+    # dev-use1.yaml before deploying prod-usw2.yaml would prove nothing about
+    # the thing being deployed.
+    #
+    # Space-separated globs. Unmatched globs are skipped, not an error, so a
+    # glob naming a tier that does not exist yet is harmless.
+    #
+    # THIS IS THE ONLY LINE IN THIS FILE THAT DIFFERS FROM THE INFRA REPO'S
+    # COPY. Everything else here is repo-agnostic on purpose - see ci/README.md
+    # on which files are shared verbatim and why.
+    LINT_GLOB: "tier3-workloads/*/config/dev-use1.yaml tests/*/config/*.yaml"
+
+    # The DEPLOYMENT account - where the artifact and module buckets live.
+    # ci/lib/modules.sh defaults to this too; set here so the pipeline does not
+    # depend on that default staying in step.
+    DEPLOYMENT_ACCOUNT_ID: "977692454741"
+
+    # Created by bootstrap/deployment-roles in every target account. The build
+    # assumes this to deploy; it is NOT the role CloudFormation runs as.
+    DEPLOYMENT_ROLE_NAME: "stadion-iac-deployment-role"
+
+  exported-variables:
+    # CodePipeline reads these after the build and makes them available to
+    # later actions as #{<Namespace>.CHANGESET_NAME}.
+    #
+    # This is what makes an approval gate mean something. The plan action
+    # creates a change set and exports its name; the apply action executes THAT
+    # name. Without it the apply step would create a second change set, and a
+    # reviewer would be approving a different plan from the one applied.
+    - CHANGESET_NAME
+    - HAS_CHANGES
+
+phases:
+
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet --upgrade pip
+      # cfn-lint is what ci/lint.sh runs. Pinned deliberately: a new cfn-lint
+      # release can add rules, and a build that passed yesterday failing today
+      # because of an upstream release is confusing and blocks unrelated work.
+      # Bump this on purpose, in a PR, so the new findings get reviewed.
+      - pip install --quiet "cfn-lint==1.55.*" pyyaml
+
+      # cfn-guard enforces OUR policy - naming, tagging, encryption, IAM
+      # breadth - as opposed to cfn-lint, which checks CloudFormation itself.
+      # It is not in the CodeBuild image.
+      #
+      # Installed only when there is something for it to enforce. Every rule
+      # file in ci/rules/ is an empty placeholder today, so downloading a tool
+      # that would immediately be skipped would slow every build for nothing.
+      # The moment a rule is written, this installs it - and ci/lint.sh fails
+      # loudly rather than silently skipping if it is somehow still absent.
+      # PINNED, AND DOWNLOADED DIRECTLY - NOT VIA install-guard.sh.
+      #
+      # WHY NOT THE OFFICIAL INSTALL SCRIPT
+      #   It asks the GitHub API which release is latest, and CodeBuild's
+      #   egress addresses are shared. Unauthenticated GitHub API calls from
+      #   them get rate-limited, which arrives as:
+      #
+      #       curl: (22) The requested URL returned error: 403
+      #       error attempting to download from the github repository
+      #
+      #   That is not a permissions problem and no amount of retrying reliably
+      #   fixes it. A release asset URL needs no API call at all.
+      #
+      #   The script also installs whatever is CURRENT, which cannot satisfy a
+      #   pin: the day 3.2.2 ships, the check below would fail every build.
+      #   Pinning the download is the only version pin that actually holds.
+      #
+      # WHY PIN AT ALL
+      #   cfn-guard is a policy engine, so a release can change what PASSES -
+      #   not only what it reports. An unpinned upgrade could quietly start
+      #   accepting a policy that was rejected yesterday, with no commit in
+      #   this repo to point at.
+      #
+      # TO MOVE VERSIONS
+      #   Change GUARD_VERSION, run every rule against the fixtures locally,
+      #   and land it as its own PR so the new findings get reviewed.
+      #
+      # Installed only when there is something to enforce - the empty
+      # placeholder rules in ci/rules/ would make this a download for nothing.
+      - |
+        if find ci/rules -name '*.guard' -size +0 -print -quit 2>/dev/null | grep -q .; then
+          set -e
+          GUARD_VERSION=3.2.1
+          GUARD_DIR="cfn-guard-v3-x86_64-ubuntu-latest"
+          echo "=== rules found in ci/rules/ - installing cfn-guard ${GUARD_VERSION} ==="
+
+          curl --proto '=https' --tlsv1.2 -sSfL --retry 3 --retry-delay 2 \
+            -o /tmp/cfn-guard.tar.gz \
+            "https://github.com/aws-cloudformation/cloudformation-guard/releases/download/${GUARD_VERSION}/${GUARD_DIR}.tar.gz"
+
+          tar xzf /tmp/cfn-guard.tar.gz -C /tmp
+
+          # Into /usr/local/bin rather than exporting PATH. `export PATH=...`
+          # here is not reliably visible to the build phase where ci/lint.sh
+          # runs, and that failure reads as "cfn-guard is not installed" when
+          # it plainly is. CodeBuild runs as root, so this is writable.
+          install -m 0755 "/tmp/${GUARD_DIR}/cfn-guard" /usr/local/bin/cfn-guard
+
+          # Two DIFFERENT failures, reported differently on purpose. The first
+          # version of this reported "cfn-guard , expected 3.2.1" when the
+          # download had failed - a version mismatch message for a missing
+          # binary, which sends you looking in the wrong place entirely.
+          if ! command -v cfn-guard >/dev/null 2>&1; then
+            echo "ERROR: cfn-guard did not install." >&2
+            echo "  The download or extract failed - look above this line," >&2
+            echo "  not at the rules. This is not a rule failure." >&2
+            exit 1
+          fi
+
+          ACTUAL_GUARD="$(cfn-guard --version | awk '{print $2}')"
+          if [ "$ACTUAL_GUARD" != "$GUARD_VERSION" ]; then
+            echo "ERROR: cfn-guard is ${ACTUAL_GUARD}, expected ${GUARD_VERSION}." >&2
+            echo "  The pinned asset no longer matches its version. Update" >&2
+            echo "  GUARD_VERSION in ci/buildspec.yml deliberately." >&2
+            exit 1
+          fi
+          echo "cfn-guard ${ACTUAL_GUARD} ready"
+        else
+          echo "=== ci/rules/ is empty - skipping cfn-guard install ==="
+        fi
+
+  pre_build:
+    commands:
+      - |
+        echo "=== identity ==="
+        # Should be the DEPLOYMENT account. CodeBuild runs here; the target
+        # account is reached by assuming a role, below.
+        aws sts get-caller-identity --query '{Account:Account,Arn:Arn}' --output table
+
+      - |
+        if [ "$BUILD_MODE" = "deploy" ]; then
+          if [ -z "$UNIT_CONFIG" ]; then
+            echo "ERROR: BUILD_MODE=deploy needs UNIT_CONFIG set on the action." >&2
+            exit 1
+          fi
+          if [ ! -f "$UNIT_CONFIG" ]; then
+            echo "ERROR: config not found: ${UNIT_CONFIG}" >&2
+            exit 1
+          fi
+
+          # ---------------------------------------------------------------
+          # Build an AWS CLI profile that assumes the target account's role.
+          #
+          # WHY A PROFILE AND NOT `aws sts assume-role`
+          #   ci/package-and-deploy.sh takes --target-profile, exactly as it
+          #   does on a laptop. Writing a profile here means the pipeline runs
+          #   the script the same way you do, rather than through a second
+          #   code path that could behave differently.
+          #
+          # credential_source = EcsContainer is how a container picks up its
+          # own task credentials to perform the assume. There is no access key
+          # anywhere in this file.
+          #
+          # The target account id comes from the UNIT'S CONFIG, not from a
+          # pipeline parameter - so the account a unit deploys to is decided in
+          # one place and cannot disagree with itself.
+          # ---------------------------------------------------------------
+          TARGET_ACCOUNT="$(python -c "import yaml,sys; print(yaml.safe_load(open(sys.argv[1]))['accountId'])" "$UNIT_CONFIG")"
+          echo "target account from ${UNIT_CONFIG}: ${TARGET_ACCOUNT}"
+
+          mkdir -p "$HOME/.aws"
+          cat > "$HOME/.aws/config" <<EOF
+        [profile target]
+        role_arn = arn:aws:iam::${TARGET_ACCOUNT}:role/${DEPLOYMENT_ROLE_NAME}
+        credential_source = EcsContainer
+        region = ${AWS_REGION}
+        EOF
+
+          echo "=== confirming we can act in the target account ==="
+          aws --profile target sts get-caller-identity \
+            --query '{Account:Account,Arn:Arn}' --output table
+        fi
+
+  build:
+    commands:
+      - |
+        set -e
+        case "$BUILD_MODE" in
+
+          lint)
+            # Every unit this pipeline deploys, not just the one in this
+            # action. A run should fail on a broken unit before it starts
+            # changing infrastructure with the ones that are fine.
+            #
+            # LINT_GLOB is unquoted on purpose - it holds several globs and
+            # the shell has to expand them. Anything that does not match is
+            # skipped by the -f test below.
+            # THERE IS NO REGISTRY CHECK HERE, ON PURPOSE.
+            #
+            # docs/STACK-REGISTRY.md is generated and gitignored, so there is
+            # no committed copy that could be stale and nothing for anyone to
+            # remember. ci/lint.sh rebuilds it below as it runs.
+            #
+            # The check that matters did not need it: ci/stack-registry.py
+            # resolves every Fn::GetStackOutput against the units that exist
+            # and fails on a broken reference. That runs inside ci/lint.sh on
+            # every unit, with or without a file on disk.
+            #
+            # A staleness gate lived here briefly and failed three runs for a
+            # one-line documentation diff. Do not add it back.
+            echo "=== linting every unit matching: ${LINT_GLOB} ==="
+            FAILED=""
+            MATCHED=0
+            for cfg in ${LINT_GLOB}; do
+              [ -f "$cfg" ] || continue
+              MATCHED=$((MATCHED + 1))
+              echo
+              echo "--- ${cfg} ---"
+              bash ci/lint.sh "$cfg" || FAILED="${FAILED} ${cfg}"
+            done
+            if [ -n "$FAILED" ]; then
+              echo >&2
+              echo "ERROR: lint failed for:${FAILED}" >&2
+              exit 1
+            fi
+
+            # A glob that matches nothing is the dangerous case: the stage goes
+            # green having validated nothing, and the deploy stages that follow
+            # are the first thing to touch the templates. Fail instead.
+            if [ "$MATCHED" -eq 0 ]; then
+              echo >&2
+              echo "ERROR: LINT_GLOB matched no config files." >&2
+              echo "  glob: ${LINT_GLOB}" >&2
+              echo "  Nothing was validated, so this stage proves nothing." >&2
+              exit 1
+            fi
+
+            echo
+            echo "${MATCHED} unit(s) lint clean"
+            ;;
+
+          deploy)
+            # Create AND apply in one action. Used by the DEV pipeline, where
+            # there is no approval gate and fast iteration is the point.
+            echo "=== deploying ${UNIT_CONFIG} ==="
+            bash ci/package-and-deploy.sh "$UNIT_CONFIG" \
+              --target-profile target \
+              --execute
+            ;;
+
+          plan)
+            # Create a change set and STOP. Used by the PROMOTE pipeline, before
+            # a manual approval. Nothing is applied here.
+            echo "=== planning ${UNIT_CONFIG} ==="
+
+            # tee so the diff reaches the build log a reviewer reads, while we
+            # also parse it. Without pipefail the exit status would be tee's.
+            set -o pipefail
+            bash ci/package-and-deploy.sh "$UNIT_CONFIG" \
+              --target-profile target 2>&1 | tee /tmp/plan.log
+            set +o pipefail
+
+            # The script prints "CHANGESET_NAME=<name>" on its own line when a
+            # change set was created, and prints nothing of the sort when the
+            # stack already matches the config.
+            CHANGESET_NAME="$(grep -oE '^CHANGESET_NAME=.+$' /tmp/plan.log | tail -1 | cut -d= -f2-)"
+
+            if [ -z "$CHANGESET_NAME" ]; then
+              # NOT a failure. Re-running a promote that changes nothing is
+              # normal. HAS_CHANGES lets the apply action exit without doing
+              # anything, rather than failing on an empty change set name.
+              HAS_CHANGES=false
+              echo
+              echo "no changes for ${UNIT_CONFIG} - the apply step will be a no-op"
+            else
+              HAS_CHANGES=true
+              echo
+              echo "change set awaiting approval: ${CHANGESET_NAME}"
+            fi
+
+            export CHANGESET_NAME HAS_CHANGES
+            ;;
+
+          apply)
+            # Apply the change set the plan action created and a human approved.
+            # Named explicitly, so this cannot apply anything else.
+            if [ "${HAS_CHANGES:-true}" = "false" ] || [ -z "$CHANGESET_NAME" ]; then
+              echo "nothing to apply for ${UNIT_CONFIG} - the plan found no changes."
+              exit 0
+            fi
+
+            echo "=== applying ${CHANGESET_NAME} to ${UNIT_CONFIG} ==="
+            bash ci/package-and-deploy.sh "$UNIT_CONFIG" \
+              --target-profile target \
+              --execute-changeset "$CHANGESET_NAME"
+            ;;
+
+          *)
+            echo "ERROR: unknown BUILD_MODE '${BUILD_MODE}'." >&2
+            echo "  expected one of: lint, deploy, plan, apply" >&2
+            exit 1
+            ;;
+        esac
+
+artifacts:
+  # The source tree is passed between stages unchanged. Each Deploy stage needs
+  # the templates, the configs and ci/ - and re-cloning per stage would risk
+  # different stages running different commits.
+  files:
+    - '**/*'

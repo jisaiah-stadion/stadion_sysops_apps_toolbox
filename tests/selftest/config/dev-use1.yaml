@@ -1,0 +1,50 @@
+# Toolchain self-test — us-east-1, dev target account.
+#
+# Deploy this FIRST in a new repo or a new account. See main.yaml for the list
+# of things it proves, and why a log group is the right resource for it.
+#
+# Deploy:
+#   bash ci/lint.sh tests/selftest/config/dev-use1.yaml
+#   bash ci/package-and-deploy.sh tests/selftest/config/dev-use1.yaml \
+#     --target-profile target --execute
+#
+# Remove:
+#   bash ci/destroy.sh tests/selftest/config/dev-use1.yaml --execute
+
+# This unit nests no modules - see main.yaml for why that is deliberate.
+#
+# The version is still REQUIRED, and still meaningful: ci/lib/modules.sh syncs
+# ./modules from it before anything else runs, so a version missing from
+# ci/modules.lock, or a tarball whose checksum has moved, fails here. That is
+# half the point of this unit.
+moduleVersion: v0.8.1
+
+region: us-east-1
+regionCode: use1
+
+# The dev target account. Must already have bootstrap/deployment-roles from the
+# infra repo, or the deploy fails on the assume-role before CloudFormation is
+# ever reached.
+accountId: '326542499457'
+
+env: dev
+
+# wkl = workload. This repo is Tier 3, so every unit in it carries wkl, and
+# every stack name starts dev-wkl-. The tier codes are listed in ci/naming.yaml.
+tier: wkl
+
+parameters: {}
+
+# NOTHING TO SET, AND THAT IS CORRECT.
+#
+# LogGroupName comes from the Naming block in main.yaml, and RetentionDays has
+# a default. Confirm what the stack will be called before deploying:
+#
+#   python ci/render-config.py --emit stack-name tests/selftest/config/dev-use1.yaml
+#     -> dev-wkl-selftest
+
+tags:
+  owner: sysops
+  management: iac
+  project: toolbox
+  type: test

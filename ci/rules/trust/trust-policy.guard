@@ -1,0 +1,141 @@
+#
+# Rules applied to the RAW TRUST POLICY JSON in iam/trust-policies/.
+#
+# WHY THIS IS A SEPARATE FILE FROM ci/rules/policy/
+#   A trust policy and an identity policy are opposites on the one thing that
+#   matters most here:
+#
+#     identity policy   Principal must NOT appear - it is invalid, and IAM
+#                       rejects the whole document
+#     trust policy      Principal is the entire point - it is WHO may assume
+#                       the role
+#
+#   Running one set of rules over both would reject every correct trust policy.
+#   That is not a hypothetical: it is what the first version of these rules did.
+#
+# WHAT A TRUST POLICY IS
+#   It answers "who may become this role", and nothing else. It grants no
+#   permissions - those come from the attached policies. A mistake here does
+#   not widen what the role can do; it widens WHO can do it, which is worse and
+#   much harder to notice.
+#
+
+rule trust_policy_language_version_is_current {
+    Version == '2012-10-17'
+    <<
+    violation: trust policy Version must be "2012-10-17".
+        why: under the 2008 rules the condition keys that make a trust policy
+             safe - aws:SourceAccount, aws:SourceArn - behave differently.
+    >>
+}
+
+
+#
+# A TRUST POLICY MUST SAY WHO.
+#
+# A statement with no Principal is not a trust policy. This usually means an
+# identity policy was saved into iam/trust-policies/ by mistake - the exact
+# opposite of the paste error the identity rules catch.
+#
+rule trust_statement_names_a_principal {
+    Statement[*] {
+        Principal exists
+        <<
+        violation: a trust policy statement must name a Principal.
+            fix: an identity policy belongs in iam/policies/, not here.
+            why: Principal is WHO may assume the role. Without it this is not
+                 a trust policy at all.
+        >>
+    }
+}
+
+
+#
+# ONLY THE ASSUME-ROLE ACTIONS.
+#
+# sts:* in a trust policy is a copy-paste from an identity policy. The only
+# actions that mean anything here are the AssumeRole family.
+#
+rule trust_action_is_not_wildcard {
+    Statement[ Effect == 'Allow' ] {
+        Action != '*'
+        Action != 'sts:*'
+        <<
+        violation: a trust policy must name the assume action.
+            fix: "Action": "sts:AssumeRole"  (or sts:AssumeRoleWithWebIdentity,
+                 sts:TagSession as needed).
+            why: sts:* here is a copy-paste from an identity policy. Only the
+                 AssumeRole family means anything in a trust policy.
+        >>
+    }
+}
+
+
+#
+# A WILDCARD PRINCIPAL MUST BE CONDITIONED.
+#
+# "Principal": {"AWS": "*"} means EVERY AWS ACCOUNT IN THE WORLD may assume
+# this role. It is occasionally legitimate - it is the only way to name an
+# Identity Center role whose ARN ends in a hash nobody chooses - but only when
+# a Condition narrows it back down.
+#
+# Our own KMS key policies use exactly this shape, with ArnLike on
+# aws:PrincipalArn. That is the pattern to copy. What must never ship is the
+# wildcard on its own.
+#
+rule wildcard_principal_requires_a_condition {
+    Statement[ Effect == 'Allow' ] {
+        when Principal.AWS == '*' {
+            Condition exists
+            <<
+            violation: Principal AWS "*" with no Condition.
+                fix: add a Condition that narrows it, e.g.
+                     "ArnLike": { "aws:PrincipalArn":
+                       "arn:aws:iam::<account>:role/aws-reserved/sso.amazonaws.com/*AWSReservedSSO_Admin*" }
+                why: an unconditioned wildcard principal lets EVERY AWS
+                     account assume this role. This is the single most
+                     damaging mistake a trust policy can contain.
+            >>
+        }
+    }
+}
+
+
+#
+# CONFUSED-DEPUTY CONDITIONS ON SERVICE PRINCIPALS ARE **NOT** A RULE HERE,
+# AND THAT IS A DELIBERATE DECISION. Read this before adding one.
+#
+# The concern is real. A service principal is shared: "lambda.amazonaws.com"
+# means the Lambda service in ANY account, not your functions. Where a service
+# passes a source, aws:SourceAccount and aws:SourceArn close that gap, and
+# tier0-networking/flow-logs is the example worth copying - vpc-flow-logs is
+# shared, so its trust policy carries both.
+#
+# BUT IT CANNOT BE ENFORCED MECHANICALLY, because not every service supplies a
+# source. lambda.amazonaws.com is the common case: a function assumes its own
+# execution role directly, and there is no third party to confuse. There is no
+# aws:SourceArn in that request at all.
+#
+# So a condition on it would not merely be useless - the key would be ABSENT,
+# StringEquals would not match, and the role would become UNASSUMABLE. The
+# function would fail to start.
+#
+# This rule existed, failed iam/trust-policies/lambda.json, and was removed.
+# cfn-guard has no warning level: a rule either fails the build or does not
+# exist. A rule that fails correct files is worse than no rule, because it
+# teaches people that guard failures are noise to be worked around.
+#
+# Judge it in review instead: "does this service pass a source, and if so are
+# the conditions here?"
+#
+
+rule every_trust_statement_has_a_sid {
+    Statement[*] {
+        Sid exists
+        <<
+        violation: every trust policy statement needs a Sid.
+            why: same reason as identity policies - it is how a reviewer and
+                 a failing rule refer to the same statement by name.
+        >>
+    }
+}

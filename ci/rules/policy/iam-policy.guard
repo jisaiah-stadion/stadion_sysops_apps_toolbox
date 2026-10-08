@@ -1,0 +1,192 @@
+#
+# Rules applied to the RAW POLICY JSON in iam/policies/.
+#
+# WHAT THIS FILE IS FOR
+#   These check what a policy GRANTS. The companion file,
+#   ci/rules/template/iam-breadth.guard, checks how a resource is DECLARED.
+#
+# WHY TWO FILES INSTEAD OF ONE
+#   The same policy has two shapes. In iam/policies/*.json a resource ARN is a
+#   plain string:
+#
+#       "Resource": "arn:${Partition}:s3:::bucket/*"
+#
+#   By the time it reaches the generated template it is an Fn::Sub map, because
+#   the placeholders have to resolve at deploy time:
+#
+#       Resource: { "Fn::Sub": "arn:${AWS::Partition}:s3:::bucket/*" }
+#
+#   A rule written against one shape cannot see the other. Checking the source
+#   JSON also means the failure names the file an author edits.
+#
+# HOW cfn-guard IS POINTED AT THESE
+#   ci/lint.sh runs it a second time with --rules ci/rules/policy and one
+#   --data per file in iam/policies/. The top level of the data is the policy
+#   document itself, so these rules start at Version and Statement rather than
+#   at Resources.
+#
+# NOTE ON Action AND Resource SHAPES
+#   Both may be a single string OR a list, and real policies mix the two in one
+#   document. cfn-guard compares every element when the value is a list and the
+#   value itself when it is a scalar, so a plain `Action != '*'` covers both.
+#   The fixtures this was developed against cover both shapes deliberately.
+#
+
+#
+# THE POLICY LANGUAGE VERSION.
+#
+# Without 2012-10-17, IAM applies the 2008 rules, under which policy variables
+# such as ${aws:username} are NOT interpolated - they are matched literally.
+# A policy meant to scope a user to their own resources silently scopes it to
+# nothing instead, and nothing in AWS warns you.
+#
+rule policy_language_version_is_current {
+    Version == '2012-10-17'
+    <<
+    violation: policy Version must be "2012-10-17".
+        why: under the 2008 version, policy variables like ${aws:username}
+             are not interpolated - they match literally, and a policy meant
+             to scope to one user quietly matches nothing.
+    >>
+}
+
+
+#
+# NO FULL ADMINISTRATOR.
+#
+# Action "*" on Resource "*" is AdministratorAccess written by hand. If a role
+# genuinely needs that, it is a decision for a person, not something that
+# should arrive in a policy file during a busy afternoon.
+#
+# The permissions boundary would cap it anyway - but relying on that means the
+# policy says one thing and the account does another, which is how a boundary
+# change later becomes an unintended privilege grant.
+#
+rule no_wildcard_action {
+    Statement[ Effect == 'Allow' ] {
+        Action != '*'
+        <<
+        violation: Action "*" grants every action in AWS.
+            fix: name the actions, or the service prefixes you need.
+            why: this is AdministratorAccess. The permissions boundary caps
+                 it today, which means the policy and the real permissions
+                 disagree - and a boundary change later silently widens it.
+        >>
+    }
+}
+
+
+#
+# NO WHOLE-SERVICE IAM ACCESS.
+#
+# iam:* is the escalation service. Anything holding it can create a role,
+# attach a policy to it, and assume it. It is also almost never what was meant:
+# the usual intent is a couple of read actions.
+#
+rule no_wildcard_iam_access {
+    Statement[ Effect == 'Allow' ] {
+        Action != 'iam:*'
+        <<
+        violation: Action "iam:*" grants every IAM action.
+            fix: name them - iam:GetRole, iam:ListRoles, and so on.
+            why: iam:* means create a role, attach a policy, assume it. It is
+                 the escalation service, and is rarely what was intended.
+        >>
+    }
+}
+
+
+#
+# NO UNSCOPED PassRole.
+#
+# iam:PassRole on "*" means "hand ANY role in this account to a service".
+# Combined with a service that runs code - Lambda, ECS, EC2 - that is a
+# complete escalation: pass a more privileged role to a function you control.
+#
+# PassRole is legitimate. It just has to name which roles.
+#
+rule passrole_must_be_scoped {
+    Statement[ Effect == 'Allow' ] {
+        when Action == 'iam:PassRole' {
+            Resource != '*'
+            <<
+            violation: iam:PassRole must name the roles it may pass.
+                fix: Resource: "arn:${Partition}:iam::${AccountId}:role/${OrgName}-${Env}-*"
+                     and add a condition on iam:PassedToService.
+                why: PassRole on "*" hands ANY role to a service. With a
+                     service that runs code, that is a complete escalation.
+            >>
+        }
+    }
+}
+
+
+#
+# NO NotAction WITH Allow.
+#
+# "Allow everything except X" grants every service AWS has ever launched, and
+# every service it launches tomorrow. The blast radius grows on its own, with
+# no change to the policy and no review.
+#
+# NotAction is fine with Deny, where the same property works in your favour.
+#
+rule no_notaction_with_allow {
+    Statement[ Effect == 'Allow' ] {
+        NotAction not exists
+        <<
+        violation: NotAction with Effect Allow.
+            fix: list the actions to allow instead.
+            why: "everything except X" includes every service AWS launches
+                 in future. The grant widens with no change to this file and
+                 no review.
+        >>
+    }
+}
+
+
+#
+# NO Principal IN AN IDENTITY POLICY.
+#
+# Principal belongs in a RESOURCE policy - a bucket policy, a key policy, a
+# trust policy. In an identity policy it is not just useless, it is INVALID,
+# and IAM rejects the whole document.
+#
+# This is the most common paste error: copying a key policy or a trust policy
+# into iam/policies/ instead of iam/trust-policies/.
+#
+rule no_principal_in_identity_policy {
+    Statement[*] {
+        Principal not exists
+        <<
+        violation: Principal in an identity policy.
+            fix: a trust policy belongs in iam/trust-policies/, not
+                 iam/policies/. A bucket or key policy belongs with the
+                 resource it protects.
+            why: Principal is only valid in a RESOURCE policy. IAM rejects an
+                 identity policy that contains one.
+        >>
+    }
+}
+
+
+#
+# EVERY STATEMENT NEEDS A Sid.
+#
+# Not an AWS requirement. It is a review requirement: a Sid is what lets a
+# reviewer, a failing guard rule, and a CloudTrail investigation all refer to
+# the same statement by name instead of by index.
+#
+# "/Statement/3" in an error message means counting braces in a diff.
+#
+rule every_statement_has_a_sid {
+    Statement[*] {
+        Sid exists
+        <<
+        violation: every statement needs a Sid.
+            fix: add a short name, e.g. "Sid": "ReadAppData".
+            why: not required by AWS, required by us - it is how a reviewer,
+                 a guard failure and a CloudTrail entry refer to the same
+                 statement. Without it errors say "/Statement/3".
+        >>
+    }
+}

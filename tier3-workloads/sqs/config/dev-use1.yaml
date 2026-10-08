@@ -1,0 +1,119 @@
+# Tier 3 SQS queues — us-east-1, dev target account.
+#
+# ============================================================================
+# BEFORE THE FIRST DEPLOY, CHANGE THE QUALIFIER.
+#
+# The queue's name comes from the QUALIFIER in main.yaml's Naming block, NOT
+# from this file:
+#
+#     qualifier: example  ->  dev-wkl-sqs-example
+#
+# `example` is a deliberate stand-in. Change it to what the queue is FOR -
+# orders, notifications, ingest - before anything is created.
+#
+# Renaming it later changes the queue name, which REPLACES the queue, and the
+# replacement starts EMPTY. Anything still in flight is lost. The DLQ is
+# DeletionPolicy: Retain, so that one survives and then blocks the new one on
+# a name collision until it is removed by hand.
+#
+# A deleted queue's name also cannot be reused for 60 seconds, so a
+# replacement can fail with QueueDeletedRecently. Retrying after a minute
+# works.
+# ============================================================================
+#
+# THIS UNIT HAS NO PIPELINE STAGE YET.
+#
+# pipelines/apps-dev.yaml lints it on every push and deploys nothing. There is
+# a commented-out DeploySqs block at the bottom of that file; uncomment it and
+# redeploy the pipeline stack when this unit is ready.
+#
+# DEPLOY ORDER - one unit must exist first, in the INFRA repo. A missing one
+# fails when the change set is created rather than at apply:
+#
+#     1. tier1-security/shared-kms    the sqs key          (infra repo)
+#     2. tier3-workloads/sqs          <- this unit
+#
+# AND stadion-cfn-execution-role NEEDS ITS SQS STATEMENT.
+#   bootstrap/deployment-roles in the infra repo grew a ManageSqsQueues
+#   statement for this. If that stack has not been redeployed in the target
+#   account, this unit fails with AccessDenied on sqs:CreateQueue - which
+#   ci/lint.sh cannot catch, because linting never calls AWS.
+#
+# Deploy:
+#   bash ci/lint.sh tier3-workloads/sqs/config/dev-use1.yaml
+#   bash ci/package-and-deploy.sh \
+#     tier3-workloads/sqs/config/dev-use1.yaml \
+#     --target-profile target
+
+# v0.9.0 is the version that first contains modules/sqs-queue.
+#
+# IT MUST ALSO BE LISTED IN ci/modules.lock, with its hash, or the build fails
+# closed before anything is read. That is two deliberate edits - the version
+# here and the hash there - so a version cannot be adopted without its
+# contents being pinned too.
+#
+#   modules repo:  bash ci/publish.sh v0.9.0
+#   it prints the exact line to paste into ci/modules.lock
+moduleVersion: v0.9.0
+
+region: us-east-1
+regionCode: use1
+accountId: '326542499457'
+
+env: dev
+
+# wkl = workload. Every unit in this repo is Tier 3, so every stack name starts
+# dev-wkl-.
+tier: wkl
+
+# NO `app:` HERE, DELIBERATELY.
+#
+# Every queue in the account lives in this one unit, so the stack is named for
+# the folder alone:
+#
+#     dev-wkl-sqs
+#
+# An `app:` segment would put one queue's name into the STACK name, and a
+# different stack name is a different stack - the pipeline would create a
+# second stack with a second queue and leave the first running, orphaned.
+#
+# Confirm before the first deploy:
+#   python ci/render-config.py --emit stack-name tier3-workloads/sqs/config/dev-use1.yaml
+
+parameters:
+
+  # Standard queue. At-least-once delivery, no ordering guarantee.
+  #
+  # CHANGING THIS LATER REPLACES THE QUEUE and the replacement is empty.
+  FirstQueueFifo: 'false'
+
+  # With a dead-letter queue, giving dev-wkl-sqs-example-dlq.
+  FirstQueueCreateDlq: 'true'
+
+  # Five receives before a message is moved aside.
+  #
+  # Set this WITH the visibility timeout below. It counts receives, not
+  # failures: a consumer that is still working when the timeout expires has its
+  # message redelivered to someone else, and that used one attempt. A timeout
+  # that is too short burns all five on messages that were being handled fine.
+  FirstQueueMaxReceiveCount: 5
+
+  # 30 seconds is the AWS default and almost certainly wrong for a real
+  # consumer. For a Lambda consumer, use at least six times the function
+  # timeout - a batch can be retried, and the queue has to stay hidden for all
+  # of it.
+  FirstQueueVisibilityTimeoutSeconds: 30
+
+  # Four days on the queue, fourteen on the DLQ.
+  #
+  # The asymmetry is the point. A message keeps its ORIGINAL enqueue timestamp
+  # when it moves to the DLQ, so equal retentions would leave almost no time to
+  # act on a message that failed near the end of its life.
+  FirstQueueMessageRetentionDays: '4'
+  FirstQueueDlqMessageRetentionDays: '14'
+
+tags:
+  owner: sysops
+  management: iac
+  project: toolbox
+  type: workload
