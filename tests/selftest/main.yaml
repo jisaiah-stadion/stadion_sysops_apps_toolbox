@@ -1,0 +1,99 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Toolchain self-test. Creates one CloudWatch log group and nothing else. Its
+  only job is to prove that this repo can deploy at all - it is not part of any
+  workload and nothing consumes it.
+
+# =============================================================================
+# WHAT THIS IS FOR
+#
+# A brand new repo, or a brand new target account, has a long list of things
+# that can be wrong before any real unit has a chance to work:
+#
+#   - the module tarball is not reachable from this repo's credentials
+#   - the version in ci/modules.lock does not match what the bucket serves
+#   - ci/naming.yaml cannot compose a name for this tier
+#   - the CodeBuild role cannot assume into the target account
+#   - stadion-cfn-execution-role does not exist, or cannot create anything
+#   - the artifact bucket or its KMS key is not writable
+#
+# Every one of those produces a confusing failure in the middle of a real
+# deploy. This unit fails on exactly the same things, in about a minute, while
+# creating one resource that costs nothing and holds no data.
+#
+# WHY A LOG GROUP AND NOT SOMETHING SIMPLER
+#   It has to be a resource the execution role is actually allowed to create,
+#   or the test proves nothing about the real path. stadion-cfn-execution-role
+#   has a ManageLogGroups statement, so this exercises a genuine permission
+#   rather than a lucky one.
+#
+#   It is also free at this retention, holds nothing sensitive, and deleting it
+#   has no consequences - which is the opposite of every other resource type
+#   this repo will eventually create.
+#
+# WHY IT NESTS NO MODULES
+#   So it still works on a day when a module is broken or a new version has
+#   not been published. The module tarball is STILL fetched before this runs -
+#   ci/lib/modules.sh syncs ./modules from `moduleVersion` for every unit - so
+#   the fetch, the version pin and the checksum are all still proved.
+#
+# RUN IT FIRST, in a new repo or a new account:
+#   bash ci/lint.sh tests/selftest/config/dev-use1.yaml
+#   bash ci/package-and-deploy.sh tests/selftest/config/dev-use1.yaml \
+#     --target-profile target --execute
+#
+# Then delete it, or leave it - it costs nothing either way:
+#   bash ci/destroy.sh tests/selftest/config/dev-use1.yaml --execute
+# =============================================================================
+
+Metadata:
+
+  cfn-lint:
+    config:
+      regions:
+        - us-east-1
+
+  Naming:
+    # Composes to dev-wkl-logs-selftest. If THIS fails, the problem is
+    # ci/naming.yaml or the config, and no AWS call has happened yet.
+    LogGroupName: { type: log-group, qualifier: selftest }
+
+Parameters:
+
+  LogGroupName:
+    Type: String
+    Description: Built from the Naming block above by ci/render-config.py.
+
+  RetentionDays:
+    Type: Number
+    Description: >-
+      Kept at the minimum. This group is never written to, so retention only
+      governs how long an empty group keeps empty records.
+    Default: 1
+    AllowedValues: [1, 3, 5, 7, 14, 30]
+
+Resources:
+
+  SelfTestLogGroup:
+    Type: AWS::Logs::LogGroup
+    # Retain would leave a named resource behind that a second run then
+    # collides with - which turns the smoke test into a thing that only works
+    # once. Delete is correct here and only here.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/stadion/selftest/${LogGroupName}'
+      RetentionInDays: !Ref RetentionDays
+
+Outputs:
+
+  LogGroupArn:
+    Description: >-
+      Proof the deploy worked. Nothing consumes this - it exists so the deploy
+      has an output to print, and so the stack registry has something to list.
+    Value: !GetAtt SelfTestLogGroup.Arn
+
+  LogGroupNameOut:
+    Description: The composed name, so you can see what ci/naming.yaml produced.
+    Value: !Ref SelfTestLogGroup

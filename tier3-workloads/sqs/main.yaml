@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  Tier 3 workloads - the account's SQS queues. One nested module call per
+  queue, each creating the queue and optionally its dead-letter queue. Reads
+  the shared SQS key from Tier 1.
+
+# =============================================================================
+# ONE UNIT, ALL THE QUEUES - the same shape as tier2-platform/rds and
+# tier1-security/shared-kms, and for the same reason.
+#
+# One queue per unit would give each its own stack, its own deploy stage here,
+# and - once a promote pipeline exists - plan, approve and apply for EVERY
+# environment. Ten queues as ten units is thirty approval gates for something
+# that should be one review.
+#
+# The isolation that buys is smaller than it looks: CloudFormation rolls back
+# the resources it CHANGED, so a failed update to one queue only disturbs
+# another if both changed in the same deploy. Change one at a time and read the
+# plan.
+#
+# ADDING A QUEUE
+#   1. Add a Naming entry below with a NEW qualifier.
+#   2. Add its parameters, all prefixed with the same word.
+#   3. Add a nested stack, copying the one below.
+#   4. Add its knobs to config/<env>-use1.yaml.
+#   No pipeline change - the stage deploys this whole unit.
+#
+# WHAT LIVES IN TIER 1, NOT HERE
+#   The KMS key is read, never created. References point downward only.
+#
+#   PASS THE KEY *ID*, NOT THE *KeyArn OUTPUT. shared-kms publishes SqsKeyArn
+#   from the kms-key module's KeyArnAnyRegion - a WILDCARD-REGION form that
+#   exists for IAM policy statements, so one statement covers the primary and
+#   its us-west-2 replica:
+#
+#       arn:aws:kms:*:326542499457:key/mrk-...
+#                ^^^
+#
+#   That is not a usable key identifier, and the API rejects it with a message
+#   that reads like a permissions problem. SqsKeyId is the one to use, and for
+#   a multi-region key the id is identical in every region - so the same
+#   reference resolves to the primary in us-east-1 and the replica in
+#   us-west-2 with no change.
+#
+# NO QUEUE POLICIES IN THIS UNIT
+#   Lambda consumers poll with their own execution role - an event source
+#   mapping is the Lambda service polling, not a push - so nothing needs to be
+#   granted on the queue itself. stadion-cfn-execution-role is not given
+#   sqs:AddPermission, and the permissions boundary denies it.
+#
+#   If a queue ever needs SNS, EventBridge or S3 to PUSH to it, that needs a
+#   queue policy here AND the service principal added to the SQS key's policy
+#   in tier1-security/shared-kms. The key half is the one that fails silently.
+# =============================================================================
+
+Metadata:
+
+  cfn-lint:
+    config:
+      regions:
+        - us-east-1
+
+  Naming:
+    # Composes to dev-wkl-sqs-<qualifier>. The module appends ".fifo" and
+    # "-dlq" itself - do not put either in a qualifier.
+    #
+    # A queue name is capped at 71 rather than the AWS limit of 80, because the
+    # longest name the module builds from it is "<name>-dlq.fifo". See
+    # ci/naming.yaml.
+    FirstQueueName: { type: sqs-queue, qualifier: example }
+
+Parameters:
+
+  Env:
+    Type: String
+    Description: >-
+      Environment code. Supplied automatically from `env:` in the config.
+
+      Used to address the stacks this unit reads from - every one of them is
+      named <env>-<tier>-<unit>, so this single value locates the shared KMS
+      key in whichever environment is being deployed.
+    AllowedValues: [sbox, dev, test, prep, prod]
+
+  FirstQueueName:
+    Type: String
+    Description: Built from the Naming block above by ci/render-config.py.
+
+  # --- the knobs a queue actually needs ---------------------------------------
+
+  FirstQueueFifo:
+    Type: String
+    Description: >-
+      true makes this a FIFO queue and appends ".fifo" to both queue names.
+
+      CHANGING THIS ON A LIVE QUEUE REPLACES IT, and the replacement starts
+      empty. Standard and FIFO are different queue types, not a setting.
+
+      Standard is at-least-once delivery with no ordering guarantee; FIFO is
+      exactly-once processing within a message group at a lower throughput
+      ceiling. If you are not sure, you want standard.
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+  FirstQueueCreateDlq:
+    Type: String
+    Description: >-
+      true creates <name>-dlq alongside the queue and redirects messages to it
+      after FirstQueueMaxReceiveCount failed receives.
+
+      false means a message a consumer cannot process is retried until it
+      expires - which both blocks progress and hides the failure.
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  FirstQueueMaxReceiveCount:
+    Type: Number
+    Description: >-
+      How many times a message may be RECEIVED before it moves to the DLQ.
+
+      Counts receives, not failures. A consumer still working when the
+      visibility timeout expires has its message redelivered, and that used one
+      attempt - so this and FirstQueueVisibilityTimeoutSeconds have to be set
+      together or healthy messages end up in the DLQ.
+    Default: 5
+    MinValue: 1
+    MaxValue: 1000
+
+  FirstQueueVisibilityTimeoutSeconds:
+    Type: Number
+    Description: >-
+      How long a received message is hidden while one consumer works on it.
+
+      SET THIS FROM HOW LONG THE CONSUMER ACTUALLY TAKES, with headroom. For a
+      Lambda consumer AWS recommends at least six times the function timeout,
+      because a batch can be retried.
+
+      30 is the AWS default and a placeholder, not a recommendation.
+    Default: 30
+    MinValue: 0
+    MaxValue: 43200
+
+  FirstQueueMessageRetentionDays:
+    Type: String
+    Description: >-
+      How long the queue keeps a message nobody deletes. The deadline for the
+      whole system: a consumer down longer than this loses the backlog with no
+      error anywhere.
+
+      Days, not seconds - the module converts. The allowed list matches the
+      module's conversion mapping.
+    Default: '4'
+    AllowedValues: ['1', '2', '3', '4', '5', '6', '7', '10', '14']
+
+  FirstQueueDlqMessageRetentionDays:
+    Type: String
+    Description: >-
+      Retention for the DLQ, INDEPENDENT of the queue's own, and 14 by default.
+
+      A message keeps its ORIGINAL enqueue timestamp when it moves to a DLQ -
+      the clock does not reset. With 4 days on both, a message that fails on
+      day 3 has one day left in the DLQ, and nobody looks at a DLQ within a
+      day. There is no good reason to lower this.
+    Default: '14'
+    AllowedValues: ['1', '2', '3', '4', '5', '6', '7', '10', '14']
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # The first queue.
+  #
+  # Everything structural - the KMS key - is read from the stack that owns it,
+  # so there is no value here that can drift out of step with Tier 1.
+  # ---------------------------------------------------------------------------
+  FirstQueue:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../../modules/sqs-queue/template.yaml
+      Parameters:
+        # No ".fifo" and no "-dlq" - the module composes both, and puts the
+        # ".fifo" suffix last where AWS requires it.
+        QueueName: !Ref FirstQueueName
+
+        FifoQueue: !Ref FirstQueueFifo
+
+        # --- the dead-letter queue ---
+        CreateDlq: !Ref FirstQueueCreateDlq
+        MaxReceiveCount: !Ref FirstQueueMaxReceiveCount
+        DlqMessageRetentionDays: !Ref FirstQueueDlqMessageRetentionDays
+
+        # --- encryption, from Tier 1 ---
+        #
+        # SqsKeyId, NOT SqsKeyArn. See the header - the Arn output is a
+        # wildcard-region form for IAM policies and is not a usable key
+        # identifier.
+        KmsKeyId: !GetStackOutput
+          StackName: !Sub '${Env}-sec-shared-kms'
+          OutputName: SqsKeyId
+
+        # --- delivery behaviour ---
+        VisibilityTimeoutSeconds: !Ref FirstQueueVisibilityTimeoutSeconds
+        MessageRetentionDays: !Ref FirstQueueMessageRetentionDays
+
+  # ---------------------------------------------------------------------------
+  # A SECOND QUEUE GOES HERE. Copy the block above and change the prefix.
+  #
+  # Add a Naming entry with a DIFFERENT qualifier, its own parameters, and its
+  # own outputs. Nothing is shared between two queues except the KMS key.
+  #
+  #   SecondQueue:
+  #     Type: AWS::CloudFormation::Stack
+  #     Properties:
+  #       TemplateURL: ../../modules/sqs-queue/template.yaml
+  #       Parameters:
+  #         QueueName: !Ref SecondQueueName
+  #         FifoQueue: 'true'            # -> <name>.fifo + <name>-dlq.fifo
+  #         CreateDlq: 'true'
+  #         KmsKeyId: !GetStackOutput
+  #           StackName: !Sub '${Env}-sec-shared-kms'
+  #           OutputName: SqsKeyId
+  #
+  # A FIFO queue also has ContentBasedDeduplication and HighThroughputFifo.
+  # Read modules/sqs-queue/README.md before setting either: dedup false makes
+  # MessageDeduplicationId mandatory on every send, which is a contract with
+  # the producer's code.
+  # ---------------------------------------------------------------------------
+
+Outputs:
+
+  FirstQueueUrl:
+    Description: >-
+      What a producer or consumer actually calls. THIS is the value to put in a
+      consumer's configuration - not the ARN, which is for IAM policies and
+      event source mappings.
+    Value: !GetAtt FirstQueue.Outputs.QueueUrl
+
+  FirstQueueArn:
+    Description: >-
+      For IAM policies and for a Lambda event source mapping.
+
+      A consumer needs sqs:ReceiveMessage, sqs:DeleteMessage and
+      sqs:GetQueueAttributes on this - AND kms:Decrypt on the shared SQS key.
+      The KMS half is the one most often missed, and without it the event
+      source mapping polls and fails with an error that does not mention
+      encryption.
+    Value: !GetAtt FirstQueue.Outputs.QueueArn
+
+  FirstQueueNameOut:
+    Description: The composed name, including ".fifo" when FIFO.
+    Value: !GetAtt FirstQueue.Outputs.QueueNameOut
+
+  FirstQueueDlqArn:
+    Description: >-
+      The DLQ's ARN, or the literal "none" when FirstQueueCreateDlq is false.
+
+      Always present, sometimes "none" - the module's DLQ outputs are
+      unconditional on purpose, because CloudFormation cannot conditionally
+      reference a nested stack output. Check the value, not the output.
+
+      Grant an operator read access to this. A DLQ nobody can inspect is the
+      same as no DLQ.
+    Value: !GetAtt FirstQueue.Outputs.DlqArn
+
+  FirstQueueDlqUrl:
+    Description: The DLQ's URL, or "none".
+    Value: !GetAtt FirstQueue.Outputs.DlqUrl

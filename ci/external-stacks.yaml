@@ -1,0 +1,78 @@
+# Stacks another repository deploys, which units in THIS repo may read.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS FILE EXISTS
+#
+# ci/stack-registry.py resolves every Fn::GetStackOutput against the units it
+# can see, and fails the build on one it cannot. That check is the reason a
+# typo'd output name is caught on a laptop instead of when a change set is
+# built against a live account.
+#
+# The tier model splits across repositories, so Tier 3 units here read Tier 0-2
+# stacks from stadion_sysops_core_infra_toolbox - which this repo cannot see.
+# Without this file every one of those references is an error and nothing here
+# lints.
+#
+# THIS IS NOT A WAY TO SILENCE THE CHECK. A stack listed here still has its
+# regions and its output NAMES verified, so the thing the check was for still
+# works. What it cannot verify is that the other repo still publishes them -
+# see the drift note at the bottom.
+#
+# ---------------------------------------------------------------------------
+# REFRESHING IT
+#
+# In the producing repo:
+#
+#     python ci/stack-registry.py          # rewrites docs/STACK-REGISTRY.md
+#
+# That table lists every stack and every output it publishes. Copy the outputs
+# for the stacks named here.
+#
+# ---------------------------------------------------------------------------
+# THE DRIFT, STATED PLAINLY
+#
+# This is a hand-maintained copy of another repo's interface. If that repo
+# RENAMES an output, this file still lists the old name, so the reference
+# passes here and fails when the change set is built - the exact failure the
+# check exists to prevent, moved later rather than removed.
+#
+# What it does still catch is the common case: a typo, or reading an output
+# that never existed.
+#
+# The real fix is for the producing repo to publish its registry as a
+# machine-readable artifact that this file is generated from, the way modules
+# are published and pinned. Until that exists, treat a rename in Tier 0-2 as a
+# change that needs this file updated in the same PR.
+# ---------------------------------------------------------------------------
+
+dev-sec-shared-kms:
+  repo:    stadion_sysops_core_infra_toolbox
+  unit:    tier1-security/shared-kms
+  regions: [us-east-1]
+  # The nine shared CMKs, each published twice.
+  #
+  # USE THE *KeyId OUTPUTS. The *KeyArn ones are a WILDCARD-REGION form
+  # built for IAM policy statements (arn:aws:kms:*:...) and are NOT a
+  # usable key identifier - the API rejects one with a message that
+  # reads like a permissions problem. They are listed because they are
+  # legitimately read by a policy document, not because they are
+  # interchangeable.
+  outputs:
+    - CloudWatchKeyArn
+    - CloudWatchKeyId
+    - DynamoDbKeyArn
+    - DynamoDbKeyId
+    - Ec2KeyArn
+    - Ec2KeyId
+    - ElastiCacheKeyArn
+    - ElastiCacheKeyId
+    - RdsKeyArn
+    - RdsKeyId
+    - S3KeyArn
+    - S3KeyId
+    - SecretsManagerKeyArn
+    - SecretsManagerKeyId
+    - SnsKeyArn
+    - SnsKeyId
+    - SqsKeyArn
+    - SqsKeyId

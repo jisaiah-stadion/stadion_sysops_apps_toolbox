@@ -1,0 +1,40 @@
+# Ownership for the Tier 3 workloads repo.
+#
+# Replace @stadionmoney with your actual GitHub organization. A bare @sysops
+# would be read as a USERNAME — team references require the org prefix.
+#
+# A team must also have at least Write access to this repo
+# (Settings -> Collaborators and teams). A team without repo access is silently
+# ignored here, with no warning anywhere.
+#
+# This file is advisory unless branch protection on `main` has both
+# "Require a pull request before merging" and
+# "Require review from Code Owners" enabled.
+#
+# Last matching pattern wins — put narrower paths later when splitting
+# ownership.
+
+# ---------------------------------------------------------------------------
+# WHY THIS REPO EXISTS SEPARATELY FROM THE INFRA REPO
+#
+# docs/ARCHITECTURE.md in the infra repo splits Tier 2/3 out so that app teams
+# can own their own workloads without being able to change networking, keys or
+# permission boundaries. That split only means anything if the ownership lines
+# below are real - two repos with the same reviewers is just two repos.
+#
+# So the intended end state is:
+#
+#   ci/, pipelines/, docs/   SysOps only. These decide HOW anything deploys.
+#   tier3-workloads/<app>/   the team that owns that app, plus SysOps
+#
+# Until app teams exist, SysOps owns all of it.
+# ---------------------------------------------------------------------------
+
+# * @stadionmoney/sysops
+
+# The deployment machinery stays with SysOps even once app teams own their own
+# directories above. An app team that can edit ci/ can deploy anything, which
+# would undo the whole reason for the repo split.
+# /ci/        @stadionmoney/sysops
+# /pipelines/ @stadionmoney/sysops
+# /docs/      @stadionmoney/sysops

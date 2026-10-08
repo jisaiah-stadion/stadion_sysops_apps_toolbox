@@ -1,0 +1,498 @@
+# =============================================================================
+# ci/naming.yaml — the resource naming convention, as data
+#
+# WHAT
+#   Every resource name this platform creates is built from this file. Nothing
+#   else hardcodes a naming rule.
+#
+# WHY
+#   The convention is still under review. Rather than spread it across dozens of
+#   templates where changing it means a dozen pull requests, it lives here as a
+#   pattern you can edit. Change the two lines under `patterns:` and every name
+#   on the platform changes with them.
+#
+#   It also has to cover every AWS service, not one. Services disagree about
+#   length limits, allowed characters, and whether a name must be unique in the
+#   account, the region, or the whole world. Those differences are recorded per
+#   resource type under `resourceTypes:` below.
+#
+# HOW IT IS USED
+#   ci/render-config.py reads this file, builds each name, and passes the
+#   finished string to CloudFormation as a parameter. If a name breaks a rule -
+#   too long, illegal character, unknown segment value - the build FAILS with an
+#   explanation. It never silently truncates, because a truncated name is a name
+#   nobody can predict or search for.
+#
+#   Read ci/lib/naming.py alongside this file. It is short.
+# =============================================================================
+
+version: 1
+
+
+# -----------------------------------------------------------------------------
+# THE CONVENTION. This is the part you change.
+#
+# Segments in braces are filled in from the unit's config file and from the name
+# declaration in its main.yaml. A segment with no value is dropped along with
+# its separator, so an unused {app} or {qualifier} leaves no double hyphen.
+#
+# Two patterns, because some AWS names must be unique more widely than others:
+#
+#   regional - unique within one account and one region. Most resources.
+#              ALBs, security groups, Lambda functions, subnets, RDS instances.
+#
+#   global   - unique more widely than that, so the name carries the region to
+#              stop the us-east-1 and us-west-2 copies colliding:
+#                * IAM roles and policies are account-wide, with no region.
+#                * S3, CloudFront and Route 53 names are unique across ALL AWS
+#                  accounts everywhere.
+#
+# Regional names deliberately leave the region out. That is not just tidiness -
+# it buys back four characters, and the tightest limit on AWS is 32 characters
+# for load balancers and target groups, which are regional.
+# -----------------------------------------------------------------------------
+#   kms-alias - does not follow either of the above, because KMS aliases are an
+#               ORG-WIDE convention that predates this platform and is used by
+#               accounts that know nothing about it:
+#
+#                 stadion-dev-sec-toolbox/s3-mrk
+#                 ^org    ^env ^tier      ^qualifier
+#
+#               A slash, a trailing -mrk, and the org name in front. Composed
+#               rather than written out per key: nine keys across four
+#               environments would otherwise be 36 hand-typed strings differing
+#               in one segment, which is how a test account ends up holding a
+#               key aliased "dev".
+# -----------------------------------------------------------------------------
+#   iam       - IAM roles and policies. They were on the `global` pattern,
+#               which is wrong in a way worth spelling out: `global` puts the
+#               REGION in the name, and IAM has no region. A role called
+#               dev-use1-sec-... implies a us-west-2 twin that can never exist,
+#               because the name is account-wide and the second region would
+#               collide with the first.
+#
+#               Same shape as kms-alias, for the same reason - these names are
+#               read by people outside this platform:
+#
+#                 stadion-dev-sec-toolbox-lambda-basic-execution
+#                 ^org    ^env ^tier      ^qualifier
+#
+#               WATCH THE LENGTH. A role name is capped at 64 characters and
+#               the fixed part here is around 25, so a qualifier over ~39
+#               characters fails the build. Policies have 128 and are safe.
+patterns:
+  regional:  "{env}-{tier}-{app}-{resource}-{qualifier}"
+  global:    "{env}-{region}-{tier}-{app}-{resource}-{qualifier}"
+  kms-alias: "{org}-{env}-{tier}-{project}/{qualifier}-mrk"
+  iam:       "{org}-{env}-{tier}-{project}-{qualifier}"
+
+
+# -----------------------------------------------------------------------------
+# CONSTANTS, used by patterns that need them.
+#
+# Both are properties of THIS REPOSITORY rather than of a unit, so they live
+# here and not in a config file. A config never sets them and never should - if
+# they were per-config they could disagree between environments, which is the
+# failure this file exists to make impossible.
+#
+# org      the organisation. Never varies.
+# project  what this repository builds. One repo, one project; the apps repo
+#          will carry its own value.
+# -----------------------------------------------------------------------------
+org: stadion
+project: toolbox
+
+
+# -----------------------------------------------------------------------------
+# SERVICE CODES - short forms for the {qualifier} segment.
+#
+# WHY
+#   An IAM role name caps at 64 characters and the composed prefix
+#   (stadion-prod-sec-toolbox-) already spends 25 of them. That leaves 39 for
+#   the part that actually says what the thing is. "secretsmanager-rotation-
+#   readonly" does not fit; "asm-rotation-readonly" does.
+#
+# WHY NOT ALWAYS EXACTLY THREE LETTERS
+#   Because the point is recognition, not symmetry. s3 is two characters and
+#   every engineer reads it instantly; "s3x" saves nothing and means nothing.
+#   apigw is five and is what the console calls it. Forcing three would invent
+#   codes that need this table to decode, which defeats the purpose.
+#
+#   So: the shorthand AWS and everyone else already uses. Most are three.
+#
+# HOW TO USE IT
+#   The qualifier is what a policy or role is FOR, and it reads
+#   <service>-<what>:
+#
+#     policies/lambda-standard.json -> stadion-dev-sec-toolbox-lambda-standard
+#     policies/s3-readonly.json     -> stadion-dev-sec-toolbox-s3-readonly
+#     policies/asm-rotate.json      -> stadion-dev-sec-toolbox-asm-rotate
+#
+#   Advisory today, not enforced - a qualifier that names no service is fine
+#   where none applies. If the convention drifts, ci/lint.sh can reject the
+#   long forms later; the table is here so there is one place to agree first.
+#
+#   NOT the same as `code:` under resourceTypes below. That says what KIND of
+#   resource a name refers to (a bucket, a role). This says which SERVICE the
+#   permission is about. A policy about S3 is still a policy.
+# -----------------------------------------------------------------------------
+serviceCodes:
+
+  # compute
+  #
+  # Lambda is written OUT IN FULL, not abbreviated. There is no established
+  # three-letter form for it - "lam" is something this table would have
+  # invented, and an invented code needs this table to decode, which is the
+  # thing the codes exist to avoid. It is six characters and everybody reads
+  # it, so: lambda-standard, lambda-order-processor.
+  lambda: lambda
+  ec2:    ec2
+  ecs:    ecs
+  eks:    eks
+  btc:    batch
+  ec2ai:  ec2-image-builder
+
+  # storage
+  s3:     s3
+  efs:    efs
+  fsx:    fsx
+  bkp:    backup
+
+  # database and analytics
+  rds:    rds
+  ddb:    dynamodb
+  ecc:    elasticache
+  rsh:    redshift
+  ath:    athena
+  glu:    glue
+  kds:    kinesis-data-streams
+  fh:     kinesis-firehose
+
+  # messaging and integration
+  sqs:    sqs
+  sns:    sns
+  evb:    eventbridge
+  sfn:    step-functions
+  apigw:  api-gateway
+
+  # networking
+  vpc:    vpc
+  elb:    elastic-load-balancing
+  r53:    route53
+  cfr:    cloudfront
+  tgw:    transit-gateway
+
+  # security
+  iam:    iam
+  kms:    kms
+  asm:    secrets-manager        # "AWS Secrets Manager" - sm is too ambiguous
+  ssm:    systems-manager
+  acm:    certificate-manager
+  gd:     guardduty
+  waf:    waf
+  sh:     security-hub
+  aa:     access-analyzer
+
+  # observability
+  cwl:    cloudwatch-logs
+  cwm:    cloudwatch-metrics
+  xry:    xray
+  cta:    cloudtrail
+
+  # deployment
+  cfn:    cloudformation
+  ecr:    ecr
+  cb:     codebuild
+  cp:     codepipeline
+
+
+# -----------------------------------------------------------------------------
+# Rules applied to every name after the pattern is filled in.
+#
+# separator          the character between segments. Must match the pattern
+#                    above. A few services ban hyphens, so a resource type can
+#                    override this.
+# case               lower | upper | preserve
+# omitEmptySegments  drop segments with no value instead of leaving "a--b"
+# -----------------------------------------------------------------------------
+rules:
+  separator: "-"
+  case: lower
+  omitEmptySegments: true
+
+
+# -----------------------------------------------------------------------------
+# Allowed values per segment.
+#
+# An empty list means "anything the resource type's charset permits". A
+# non-empty list is enforced - a typo like `env: producton` instead of `prod` fails the
+# build here rather than creating a wrongly named resource in production.
+# -----------------------------------------------------------------------------
+segments:
+
+  env: [sbox, dev, test, prep, prod]
+
+  region: [use1, usw2]
+
+  # Tier codes match the four-tier dependency model, so a name states its blast
+  # radius: net = networking, sec = security, plt = platform, wkl = workload.
+  tier: [net, sec, plt, wkl]
+
+  # Free text. Comes from `app:` in the unit config. Tiers 2 and 3 only -
+  # networking and security units leave it empty.
+  app: []
+
+  # The resource type code, e.g. bkt, role, alb. Usually taken from the
+  # resourceTypes entry below rather than written out by hand.
+  resource: []
+
+  # Optional. Distinguishes two of the same thing: priv, pub, a, 01, assets.
+  qualifier: []
+
+
+# -----------------------------------------------------------------------------
+# Per-resource-type rules — the AWS service limits.
+#
+# Each entry means: "when we name one of these, use this pattern, this default
+# code, and reject the name if it breaks these limits."
+#
+#   scope             regional | global  - picks the pattern above
+#   code              default value for the {resource} segment
+#   maxLength         the AWS limit. Exceeding it FAILS the build.
+#   charset           regex the finished name must match, from the AWS docs
+#   appendAccountId   add "-<account id>" at the end (S3 only, see below)
+#   separator         override the global separator where a service bans hyphens
+#
+# ADDING A RESOURCE TYPE: copy an entry, change the values, cite the AWS limit in
+# a comment. No code changes are needed.
+# -----------------------------------------------------------------------------
+resourceTypes:
+
+  # --- storage -------------------------------------------------------------
+
+  s3-bucket:
+    scope: global
+    code: bkt
+    maxLength: 63
+    charset: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    # Bucket names are unique across every AWS account in the world, so even the
+    # global pattern is not enough on its own. The account id makes it ours.
+    appendAccountId: true
+
+  # --- security ------------------------------------------------------------
+
+  # Both use the `iam` PATTERN above, not `global`. `code` is unused by that
+  # pattern - the qualifier carries the name instead, taken from the policy's
+  # file name in policies/ or the role's name in its unit.
+  #
+  # A unit may still set the name explicitly in its config, which overrides the
+  # composed name. render-config.py validates it against the rules below and
+  # prints a NOTE so the override is visible in the build log. That is how
+  # tier0-networking/flow-logs keeps the name it was deployed with.
+  iam-role:
+    scope: iam         # IAM has no region, so a name is account-wide
+    code: role
+    maxLength: 64
+    charset: '^[a-zA-Z0-9+=,.@_-]+$'
+
+  iam-policy:
+    scope: iam
+    code: pol
+    maxLength: 128
+    charset: '^[a-zA-Z0-9+=,.@_-]+$'
+
+  # Uses the kms-alias PATTERN above, not the regional one. `code` is unused by
+  # that pattern - the qualifier carries the service name instead.
+  #
+  # Aliases are per region and per account, and are stored here WITHOUT the
+  # "alias/" prefix. The kms-key module adds it, because KMS requires it and a
+  # name carrying it would not match the charset below.
+  kms-alias:
+    scope: kms-alias
+    code: kms
+    maxLength: 250
+    charset: '^[a-zA-Z0-9:/_-]+$'
+
+  security-group:
+    scope: regional
+    code: sg
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._\-:/()#,@\[\]+=&;{}!$*]+$'
+
+  # A customer-managed prefix list. Regional, and the name must not begin with
+  # "com.amazonaws" - that prefix is reserved for AWS-managed lists. Our names
+  # start with the environment code, so that cannot happen by accident.
+  prefix-list:
+    scope: regional
+    code: pl
+    maxLength: 255
+    charset: '^[a-zA-Z0-9._\-]+$'
+
+  # --- networking ----------------------------------------------------------
+
+  vpc:
+    scope: regional
+    code: vpc
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'   # this is a Name tag, not an id
+
+  subnet:
+    scope: regional
+    code: sn
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  route-table:
+    scope: regional
+    code: rt
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  nat-gateway:
+    scope: regional
+    code: natgw
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  transit-gateway:
+    scope: regional
+    code: tgw
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  transit-gateway-attachment:
+    scope: regional
+    code: tgwatt
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  vpc-endpoint:
+    scope: regional
+    code: vpce
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  flow-log:
+    scope: regional
+    code: fl
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  # --- routing -------------------------------------------------------------
+  # 32 characters is the tightest limit on the platform. If a name has to be
+  # shortened, these are why. Drop the qualifier first, then shorten the app.
+
+  load-balancer:
+    scope: regional
+    code: alb
+    maxLength: 32
+    charset: '^[a-zA-Z0-9]([a-zA-Z0-9-]{0,30}[a-zA-Z0-9])?$'
+
+  target-group:
+    scope: regional
+    code: tg
+    maxLength: 32
+    charset: '^[a-zA-Z0-9]([a-zA-Z0-9-]{0,30}[a-zA-Z0-9])?$'
+
+  # --- compute -------------------------------------------------------------
+
+  lambda-function:
+    scope: regional
+    code: fn
+    maxLength: 64
+    charset: '^[a-zA-Z0-9-_]+$'
+
+  ecs-cluster:
+    scope: regional
+    code: ecs
+    maxLength: 255
+    charset: '^[a-zA-Z0-9-_]+$'
+
+  ecs-service:
+    scope: regional
+    code: svc
+    maxLength: 255
+    charset: '^[a-zA-Z0-9-_]+$'
+
+  # --- data ----------------------------------------------------------------
+
+  rds-instance:
+    scope: regional
+    code: rds
+    maxLength: 63
+    charset: '^[a-z][a-z0-9-]{0,61}[a-z0-9]$'   # must start with a letter
+
+  # An Aurora cluster. Capped at 52, not 63, because the rds-cluster module
+  # names the member instances after it - "<cluster>-writer" and
+  # "<cluster>-reader" - and those have to fit in 63 themselves. A cluster name
+  # that fits but whose writer does not fails at deploy, naming the writer.
+  rds-cluster:
+    scope: regional
+    code: aurora
+    maxLength: 52
+    charset: '^[a-z][a-z0-9-]{0,50}[a-z0-9]$'
+
+  dynamodb-table:
+    scope: regional
+    code: ddb
+    maxLength: 255
+    charset: '^[a-zA-Z0-9_.-]+$'
+
+  # An SQS queue. Capped at 71, not the AWS limit of 80, because the
+  # sqs-queue module builds two more names from this one and the longest is
+  # "<name>-dlq.fifo" - nine characters of suffix that have to fit inside the
+  # same 80.
+  #
+  # The ".fifo" suffix is NOT in the charset below, and that is deliberate: a
+  # FIFO queue name must end in ".fifo", but the MODULE appends it, so no
+  # composed name or qualifier should ever contain a period. Allowing one here
+  # would permit "orders.fifo" as a qualifier, which the module would turn into
+  # "orders.fifo.fifo".
+  #
+  # At 71 a FIFO dead-letter queue name comes to exactly 80. Raising this cap
+  # produces names that pass validation here and are then rejected by SQS.
+  sqs-queue:
+    scope: regional
+    code: sqs
+    maxLength: 71
+    charset: '^[a-zA-Z0-9_-]+$'
+
+  sns-topic:
+    scope: regional
+    code: sns
+    maxLength: 256
+    charset: '^[a-zA-Z0-9_-]+$'
+
+  # --- edge and observability ----------------------------------------------
+
+  cloudfront-distribution:
+    scope: global
+    code: cdn
+    maxLength: 128
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  api-gateway:
+    scope: regional
+    code: apigw
+    maxLength: 128
+    charset: '^[a-zA-Z0-9 ._-]+$'
+
+  log-group:
+    scope: regional
+    code: logs
+    maxLength: 512
+    charset: '^[a-zA-Z0-9_./#-]+$'
+
+  cloudwatch-alarm:
+    scope: regional
+    code: alarm
+    maxLength: 255
+    charset: '^[a-zA-Z0-9 ._:/=+\-@]+$'
+
+  # --- deployment ----------------------------------------------------------
+
+  cloudformation-stack:
+    scope: regional
+    code: ''           # a stack name is the unit itself, so no type code
+    maxLength: 128
+    charset: '^[a-zA-Z][a-zA-Z0-9-]{0,127}$'   # must start with a letter

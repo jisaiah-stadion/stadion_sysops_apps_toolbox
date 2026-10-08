@@ -1,0 +1,586 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: >-
+  CI/CD - the DEV pipeline for Tier 3 workloads. Source from the develop
+  branch, lint every unit, then deploy them into the dev target account.
+  Deployed BY HAND into the DEPLOYMENT account, like every other pipeline here.
+
+Metadata:
+  cfn-lint:
+    config:
+      regions:
+        - us-east-1
+
+# ---------------------------------------------------------------------------
+# STAGES: Source -> Validate -> DeploySqs.
+#
+# Validate lints EVERY unit in the repo before any deploy stage runs, so a
+# broken unit fails the run before a working one has changed anything.
+#
+# ONE DEPLOY STAGE PER UNIT, ADDED DELIBERATELY. This pipeline shipped with
+# none - Source and Validate only - so that the first push after it was created
+# could not create anything before anyone had read the trigger filters. Each
+# stage is then added when its unit is ready.
+#
+# tests/selftest has no stage and should not get one: it is a manual smoke test
+# for a new repo or a new account, not something to recreate on every push.
+#
+# ---------------------------------------------------------------------------
+# NO TRUST CHANGE IS NEEDED IN THE TARGET ACCOUNT. This is worth stating,
+# because it is the opposite of what you would expect from a brand new role.
+#
+# bootstrap/deployment-roles trusts the DEPLOYMENT ACCOUNT ROOT, not individual
+# pipeline role ARNs:
+#
+#     Principal:
+#       AWS: arn:aws:iam::<deployment account>:root
+#
+# Trusting :root DELEGATES the decision to that account's IAM rather than
+# granting anything - a principal there still needs its own explicit
+# sts:AssumeRole permission. The CodeBuildRole below has exactly that, in its
+# AssumeDeploymentRoleInTarget statement.
+#
+# Both halves are therefore already present and this pipeline can assume into
+# the target account the day it is created. The bootstrap comment calls this
+# out as deliberate: it "avoids hardcoding pipeline role names that do not
+# exist yet" - this pipeline being precisely one of those.
+#
+# WHAT **DOES** STILL BLOCK A DEPLOY is the EXECUTION role's permissions.
+# stadion-cfn-execution-role lists specific services, not *, so a service this
+# repo creates needs a statement there first. SQS was added for the queue
+# units; anything new needs the same. The symptom is AccessDenied naming the
+# resource type, at deploy time - ci/lint.sh cannot catch it, because linting
+# never calls AWS.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS A SEPARATE PIPELINE, AND A SEPARATE REPO
+#
+# Tier 3 is owned by whoever owns the app. The repo split exists so an app team
+# can change its own queues and functions without being able to touch
+# networking, keys or permission boundaries - and that only means anything if
+# the pipelines are separate too. One pipeline spanning both repos would need
+# credentials for both, which puts the boundary back where it started.
+#
+# ---------------------------------------------------------------------------
+# WHY RegionCode IS NOT PINNED TO use1 HERE
+#
+# pipelines/services-dev.yaml in the infra repo IS pinned, because everything
+# it deploys is IAM and IAM is global - a second regional copy would try to
+# create the same role names in the same account and collide.
+#
+# Tier 3 is the opposite. Queues, topics, buckets and functions are REGIONAL,
+# so a us-west-2 copy of this pipeline is a normal thing to want, deploying
+# usw2 configs of the same units. Nothing here prevents it.
+# ---------------------------------------------------------------------------
+
+Parameters:
+
+  OrgName:
+    Type: String
+    Description: >-
+      Organization short name, first segment of every resource name. Must match
+      the value used in bootstrap - the artifact bucket name is built from it.
+    Default: stadion
+    AllowedPattern: '^[a-z0-9]+$'
+    MinLength: 2
+    MaxLength: 12
+
+  ProjectName:
+    Type: String
+    Description: >-
+      The project this pipeline serves, e.g. toolbox. Must match the value the
+      infra pipelines use - every pipeline reads the same artifact bucket.
+    AllowedPattern: '^[a-z0-9-]+$'
+    MinLength: 2
+    MaxLength: 20
+
+  EnvCode:
+    Type: String
+    Description: >-
+      Environment code of the DEPLOYMENT account, used to build the artifact
+      bucket name. NOT the environment being deployed into.
+    Default: dev
+    AllowedValues: [dev]
+
+  RegionCode:
+    Type: String
+    Description: >-
+      Region segment of the naming convention, and of the artifact bucket name.
+      See the header for why this is not pinned to use1 the way the services
+      pipeline is.
+    Default: use1
+    AllowedValues: [use1, usw2]
+
+  TargetAccountId:
+    Type: String
+    Description: >-
+      The dev account this pipeline deploys into.
+
+      Must already have bootstrap/deployment-roles from the infra repo -
+      including the permissions boundary, without which any role created by a
+      Tier 3 unit fails with AccessDenied on iam:CreateRole.
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID.
+
+  ConnectionArn:
+    Type: String
+    Description: >-
+      ARN of an existing CodeConnections connection to GitHub, in THIS region.
+      The same connection the other pipelines use - connections are regional
+      but not per-pipeline, so this repo needs no new one.
+    AllowedPattern: '^arn:aws[a-z-]*:code(star-connections|connections):[a-z0-9-]+:\d{12}:connection/[a-f0-9-]+$'
+    ConstraintDescription: >-
+      Must be a CodeConnections connection ARN, e.g.
+      arn:aws:codeconnections:us-east-1:111122223333:connection/abcd-1234
+
+  RepositoryId:
+    Type: String
+    Description: >-
+      GitHub owner/repo, e.g. stadionmoney/stadion_sysops_apps_toolbox.
+
+      NOTE this is a DIFFERENT repo from the infra pipelines. A copied value
+      here deploys the wrong tree and the failure looks like a missing unit.
+    AllowedPattern: '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+
+  BranchName:
+    Type: String
+    Description: Branch that triggers this pipeline. develop, matching infra-dev.
+    Default: develop
+
+  DeploymentRoleName:
+    Type: String
+    Description: >-
+      Role created by bootstrap/deployment-roles in each target account. The
+      build assumes it to deploy. MUST match bootstrap exactly.
+    Default: stadion-iac-deployment-role
+
+  ArtifactKeyArn:
+    Type: String
+    Description: >-
+      The multi-region CMK that encrypts the artifact bucket, in THIS region.
+      CodeBuild needs kms:Encrypt and kms:GenerateDataKey on it to upload
+      packaged templates.
+    AllowedPattern: '^arn:aws[a-z-]*:kms:[a-z0-9-]+:\d{12}:key/[a-zA-Z0-9-]+$'
+
+  # ---------------------------------------------------------------------------
+  # TWO TIMEOUTS, AND THEY ARE A PAIR. BuildTimeoutMinutes must be the larger.
+  # pipelines/infra-dev.yaml in the infra repo carries the full explanation; the
+  # short version is that if CodeBuild times out first it kills the build
+  # mid-wait, so none of ci/lib/stack-wait.sh's reporting runs and the log just
+  # stops with no status and no statement of whether anything failed.
+  #
+  # Sized for what Tier 3 actually contains. Queues, topics and functions are
+  # seconds to a couple of minutes - none of them is RDS. Raise both together
+  # if that stops being true.
+  # ---------------------------------------------------------------------------
+  BuildTimeoutMinutes:
+    Type: Number
+    Description: >-
+      Per-stage ceiling for the whole build - lint, module fetch, package AND
+      the wait below. Must stay above StackWaitMinutes.
+    Default: 45
+    MinValue: 5
+    MaxValue: 480
+
+  StackWaitMinutes:
+    Type: Number
+    Description: >-
+      How long to wait for a stack to finish before reporting a timeout.
+
+      A timeout here is NOT reported as a failure - the script says the deploy
+      is still running and links to it. See ci/lib/stack-wait.sh.
+    Default: 30
+    MinValue: 5
+    MaxValue: 470
+
+Resources:
+
+  # ===========================================================================
+  # CodeBuild role - does the actual work
+  # ===========================================================================
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${OrgName}-${ProjectName}-apps-dev-codebuild-role'
+      Description: Runs ci/lint.sh and ci/package-and-deploy.sh for the apps pipeline.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              # Confused-deputy protection. Without this, any CodeBuild project
+              # in any account that somehow referenced this role could use it.
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+
+        - PolicyName: !Sub '${OrgName}-${ProjectName}-apps-codebuild-logs'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+
+        - PolicyName: !Sub '${OrgName}-${ProjectName}-apps-codebuild-artifacts'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Two different uses of the same bucket:
+              #   - CodePipeline stage artifacts (the source tree between stages)
+              #   - `aws cloudformation package` uploading templates
+              - Sid: ArtifactBucket
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:ListBucket'
+                  - 's3:GetBucketLocation'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${OrgName}-${EnvCode}-${RegionCode}-boot-bkt-artifacts-${AWS::AccountId}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${OrgName}-${EnvCode}-${RegionCode}-boot-bkt-artifacts-${AWS::AccountId}/*'
+
+              # THE SAME MODULES BUCKET THE INFRA REPO READS.
+              #
+              # This is the one thing genuinely shared between every repo: one
+              # bucket in the deployment account, immutable versioned tarballs,
+              # each pinned by hash in the consuming repo's ci/modules.lock.
+              #
+              # Read-only here. Publishing is the modules repo's job, with its
+              # own credentials.
+              - Sid: ModulesBucketReadOnly
+                Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${OrgName}-${EnvCode}-${RegionCode}-boot-bkt-modules-${AWS::AccountId}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${OrgName}-${EnvCode}-${RegionCode}-boot-bkt-modules-${AWS::AccountId}/*'
+
+              # Encrypt AND GenerateDataKey are needed to WRITE to an SSE-KMS
+              # bucket - a common omission, because reading works fine without
+              # them and the failure only appears at the packaging step.
+              - Sid: ArtifactKey
+                Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                Resource: !Ref ArtifactKeyArn
+
+        - PolicyName: !Sub '${OrgName}-${ProjectName}-apps-codebuild-assume-target'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The ONLY way this role touches the target account. It holds no
+              # permissions there itself - it assumes a role that does, and
+              # that role can only create change sets and pass the execution
+              # role.
+              #
+              # THIS IS THE HALF THAT LIVES HERE. The target account's role
+              # trusts the deployment account's :root, which delegates rather
+              # than grants - so this statement is what actually permits the
+              # assume. Both halves are required and both already exist; see
+              # the header.
+              - Sid: AssumeDeploymentRoleInTarget
+                Effect: Allow
+                Action: 'sts:AssumeRole'
+                Resource: !Sub 'arn:${AWS::Partition}:iam::${TargetAccountId}:role/${DeploymentRoleName}'
+
+  # ===========================================================================
+  # CodePipeline role - orchestrates only
+  # ===========================================================================
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${OrgName}-${ProjectName}-apps-dev-pipeline-role'
+      Description: Orchestrates the apps dev pipeline. Deploys nothing itself.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+
+        - PolicyName: !Sub '${OrgName}-${ProjectName}-apps-pipeline-artifacts'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:GetBucketVersioning'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${OrgName}-${EnvCode}-${RegionCode}-boot-bkt-artifacts-${AWS::AccountId}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${OrgName}-${EnvCode}-${RegionCode}-boot-bkt-artifacts-${AWS::AccountId}/*'
+
+              - Effect: Allow
+                Action:
+                  - 'kms:Encrypt'
+                  - 'kms:Decrypt'
+                  - 'kms:ReEncrypt*'
+                  - 'kms:GenerateDataKey*'
+                  - 'kms:DescribeKey'
+                Resource: !Ref ArtifactKeyArn
+
+        - PolicyName: !Sub '${OrgName}-${ProjectName}-apps-pipeline-source-and-build'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: UseGitHubConnection
+                Effect: Allow
+                Action:
+                  - 'codestar-connections:UseConnection'
+                  - 'codeconnections:UseConnection'
+                Resource: !Ref ConnectionArn
+
+              - Sid: RunBuilds
+                Effect: Allow
+                Action:
+                  - 'codebuild:StartBuild'
+                  - 'codebuild:BatchGetBuilds'
+                  - 'codebuild:StopBuild'
+                Resource: !GetAtt BuildProject.Arn
+
+  # ===========================================================================
+  # One CodeBuild project for every stage. See ci/buildspec.yml for why.
+  # ===========================================================================
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${OrgName}-${ProjectName}-apps-dev-build'
+      Description: Lints and deploys Tier 3 workload units for the dev pipeline.
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: !Ref BuildTimeoutMinutes
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: ci/buildspec.yml
+      Environment:
+        Type: LINUX_CONTAINER
+        # SMALL is enough: this runs a linter and the AWS CLI. The slow part is
+        # waiting on CloudFormation, which no amount of CPU changes.
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - Name: DEPLOYMENT_ACCOUNT_ID
+            Value: !Ref 'AWS::AccountId'
+
+          # Every unit THIS repo owns, and only those. The infra pipelines lint
+          # tiers 0-2; the two lists cannot overlap, because the repos do not
+          # share a tree - so neither pipeline ever reports a failure in
+          # something it does not deploy.
+          #
+          # The globs are wildcards so a new unit is linted the day its config
+          # appears, with no edit here. A new unit still needs a DEPLOY stage
+          # added below - being linted is not being deployed.
+          #
+          # ci/buildspec.yml FAILS THE STAGE if the whole set matches nothing,
+          # which is what catches a rename that silently stops linting
+          # anything. tests/selftest is always here, so it also means this
+          # pipeline is never vacuously green.
+          - Name: LINT_GLOB
+            Value: 'tier3-workloads/*/config/dev-use1.yaml tests/*/config/dev-use1.yaml'
+
+          - Name: DEPLOYMENT_ROLE_NAME
+            Value: !Ref DeploymentRoleName
+          - Name: ORGNAME
+            Value: !Ref OrgName
+          # Read by ci/lib/stack-wait.sh. Must stay below TimeoutInMinutes.
+          - Name: STACK_WAIT_MINUTES
+            Value: !Ref StackWaitMinutes
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+
+  # ===========================================================================
+  # The pipeline
+  # ===========================================================================
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${OrgName}-${ProjectName}-apps-dev'
+      # V2 is required for git trigger filters, which the Triggers block below
+      # uses. V1 ignores them silently.
+      PipelineType: V2
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Sub '${OrgName}-${EnvCode}-${RegionCode}-boot-bkt-artifacts-${AWS::AccountId}'
+        EncryptionKey:
+          Id: !Ref ArtifactKeyArn
+          Type: KMS
+
+      # =======================================================================
+      # WHAT STARTS THIS PIPELINE
+      #
+      # The five non-obvious filter rules are documented in full in
+      # pipelines/infra-dev.yaml in the INFRA repo. Read that block before
+      # editing this one. In short:
+      #
+      #   1. Declaring any trigger DISABLES the source action's own change
+      #      detection, which is why DetectChanges is false below.
+      #   2. Branches is mandatory alongside FilePaths - file paths on their
+      #      own is rejected.
+      #   3. Branches and FilePaths in ONE entry are AND-ed. Separate Push
+      #      entries are OR-ed.
+      #   4. Excludes beat Includes.
+      #   5. Each changed file is evaluated on its own; ONE passing file starts
+      #      the run.
+      # =======================================================================
+      Triggers:
+        - ProviderType: CodeStarSourceConnection
+          GitConfiguration:
+            # The Source action's NAME, not its stage name. A wrong value
+            # deploys cleanly and the pipeline then never starts on its own.
+            SourceActionName: Checkout
+            Push:
+              - Branches:
+                  Includes:
+                    - !Ref BranchName
+                FilePaths:
+                  Includes:
+                    # Every workload unit.
+                    - 'tier3-workloads/**'
+
+                    # The self-test. Linted like anything else, so a change to
+                    # it should be validated.
+                    - 'tests/**'
+
+                    # The deploy machinery. A change here changes how
+                    # everything above is deployed, so it has to trigger a run.
+                    - 'ci/**'
+                  Excludes:
+                    # Other environments' configs. A prod change must not
+                    # deploy to dev.
+                    - '**/config/sbox-*.yaml'
+                    - '**/config/test-*.yaml'
+                    - '**/config/prep-*.yaml'
+                    - '**/config/prod-*.yaml'
+
+                    # Other regions. This pipeline deploys the use1 configs;
+                    # a usw2 copy would invert this pair.
+                    - '**/config/*-usw2.yaml'
+
+                    # Documentation. Nothing under the included paths is read
+                    # at deploy time.
+                    - '**/*.md'
+
+      Stages:
+
+        - Name: Source
+          Actions:
+            - Name: Checkout
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref ConnectionArn
+                FullRepositoryId: !Ref RepositoryId
+
+                # Still used by a MANUAL start (start-pipeline-execution). The
+                # trigger above governs automatic starts only.
+                BranchName: !Ref BranchName
+
+                # MUST be false while the Triggers block above exists - a push
+                # filter disables this legacy change detection anyway. See
+                # rule 1.
+                DetectChanges: false
+              OutputArtifacts:
+                - Name: Source
+              RunOrder: 1
+
+        # Fails the run before anything is deployed.
+        #
+        # Lints EVERY unit this repo owns, not just one - a run should fail on
+        # a broken unit before it starts changing infrastructure with the ones
+        # that are fine. With no deploy stages yet, this is the whole pipeline:
+        # a PR check that proves the repo still renders, names and lints.
+        - Name: Validate
+          Actions:
+            - Name: LintAllUnits
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+                EnvironmentVariables: '[{"name":"BUILD_MODE","value":"lint","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: Source
+              OutputArtifacts:
+                - Name: Linted
+              RunOrder: 1
+
+        # =====================================================================
+        # DEPLOY STAGES, ONE PER UNIT, IN DEPENDENCY ORDER.
+        #
+        # To add one: copy the block below, change the stage name, the action
+        # name and the UNIT_CONFIG path. Nothing else varies.
+        #
+        # ORDER MATTERS AND IS NOT CHECKED FOR YOU. A unit that reads another
+        # unit's output with Fn::GetStackOutput must come AFTER it, or the
+        # change set cannot be built and the stage fails every run. ci/lint.sh
+        # resolves those references but cannot know what order you put the
+        # stages in.
+        #
+        # Every stage takes `Linted` as its input artifact, not `Source`, so a
+        # deploy can only ever run on a tree that passed Validate.
+        # =====================================================================
+        - Name: DeploySqs
+          Actions:
+            - Name: Sqs
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+                EnvironmentVariables: '[{"name":"BUILD_MODE","value":"deploy","type":"PLAINTEXT"},{"name":"UNIT_CONFIG","value":"tier3-workloads/sqs/config/dev-use1.yaml","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: Linted
+              RunOrder: 1
+
+Outputs:
+
+  PipelineName:
+    Description: Watch it with `aws codepipeline get-pipeline-state --name <this>`.
+    Value: !Ref Pipeline
+
+  BuildProjectName:
+    Value: !Ref BuildProject
+
+  CodeBuildRoleArn:
+    Description: >-
+      The role that assumes into the target account.
+
+      It needs NO trust change over there: bootstrap/deployment-roles trusts
+      the deployment account's :root, which delegates to this account's IAM,
+      and this role carries the matching sts:AssumeRole grant itself.
+
+      Record it anyway. It is the principal that shows up in the target
+      account's CloudTrail for everything this pipeline deploys.
+    Value: !GetAtt CodeBuildRole.Arn

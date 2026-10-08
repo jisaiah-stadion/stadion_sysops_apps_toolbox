@@ -1,0 +1,63 @@
+# Module version lock file — stadion_sysops_apps_toolbox
+#
+#   <version>  <sha256 of stadion-modules-<version>.tar.gz>
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS IS FOR
+#
+# ci/fetch-modules.sh downloads a module tarball by KEY, not by S3 versionId.
+# The modules bucket denies DeleteObject, so a published version cannot be
+# removed - but nothing stops someone writing over the same key. That creates a
+# new S3 version and silently changes what `moduleVersion: v0.9.0` resolves to.
+# Versioning keeps the old bytes, but nothing points at them any more.
+#
+# This file closes that. The hash lives in git, gets reviewed in the PR that
+# adopts a version, and is checked on every build before the tarball is
+# extracted.
+#
+# ---------------------------------------------------------------------------
+# THIS FILE IS PER-REPO, AND THAT IS THE POINT
+#
+# Every repo reads from the SAME modules bucket in the deployment account
+# (977692454741), so the tarballs and their hashes are identical everywhere.
+# The LOCK is still per-repo, because the question it answers is not "what does
+# v0.9.0 contain" - it is "has anyone in THIS repo reviewed and accepted
+# v0.9.0".
+#
+# So this file starts almost empty even though the infra repo's copy lists
+# seven versions. A version is added here the first time a unit in THIS repo
+# pins it. Copying the infra repo's whole list in would pre-approve versions
+# nobody here has looked at, which is the opposite of what the file is for.
+#
+# ---------------------------------------------------------------------------
+# ADOPTING A NEW MODULE VERSION IS TWO EDITS
+#
+#   1. `moduleVersion:` in the unit's config file
+#   2. a line here
+#
+# That is deliberate friction. One edit would mean pinning a version without
+# pinning its contents, which is the thing this exists to prevent. The modules
+# repo's ci/publish.sh prints the exact line to paste, and also records it in
+# that repo's CHECKSUMS file.
+#
+# A version that is not listed here FAILS THE BUILD. It is not skipped - a
+# check you can bypass by forgetting a line is not a check.
+#
+# ---------------------------------------------------------------------------
+# IF A CHECKSUM EVER MISMATCHES
+#
+# Do not "fix" it by editing this file. Either a published tarball was
+# overwritten, which is supposed to be impossible, or the entry is wrong. Find
+# out which before deploying anything built from it.
+#
+# To get a hash without republishing:
+#   aws s3 cp s3://<modules-bucket>/stadion-modules-<version>.tar.gz - | sha256sum
+# ---------------------------------------------------------------------------
+
+# The newest version published at the time this repo was created. Carried over
+# from the infra repo's lock, which has been deploying from it.
+v0.8.1  4e683504f885b51979064fed1031dd88608527cd2001cf67944fde445f585feb
+
+# ADD v0.9.0 HERE once the sqs-queue module is published. `ci/publish.sh v0.9.0`
+# in the modules repo prints the line to paste.
+v0.9.0  e187f803f2eaa00d39cdf3523a0bec699b6700a0999efbec240e99d709d458dd

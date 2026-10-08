@@ -1,0 +1,126 @@
+#
+# IAM rules applied to CLOUDFORMATION TEMPLATES.
+#
+# WHAT THIS FILE IS FOR
+#   cfn-lint checks that a template is valid CloudFormation. These rules check
+#   that it matches OUR standards - things AWS would happily deploy and we have
+#   decided not to do.
+#
+#   The companion file is ci/rules/policy/iam-policy.guard, which checks the
+#   raw policy JSON in iam/policies/. Two files because the two surfaces have
+#   different shapes: in a template a policy string may be an Fn::Sub map,
+#   while in the source JSON it is a plain string. Rules about what a policy
+#   GRANTS belong there; rules about how a resource is DECLARED belong here.
+#
+# WHY A `when ... !empty` GUARD ON EVERY RULE
+#   A query that matches nothing is a retrieval FAILURE in cfn-guard, not a
+#   pass. Without the guard, every template containing no IAM at all - which is
+#   most of them - would fail these rules. The guard makes them "check this if
+#   it is here".
+#
+
+let iam_roles     = Resources.*[ Type == 'AWS::IAM::Role' ]
+let iam_users     = Resources.*[ Type == 'AWS::IAM::User' ]
+let iam_keys      = Resources.*[ Type == 'AWS::IAM::AccessKey' ]
+let inline_policy = Resources.*[ Type == 'AWS::IAM::Policy' ]
+
+
+#
+# EVERY ROLE MUST CARRY THE PERMISSIONS BOUNDARY.
+#
+# This is the control that makes "the pipeline can create roles" safe. Without
+# a boundary a role can be created more privileged than the thing creating it,
+# then handed to a service - the standard escalation path.
+#
+# The execution role is also only PERMITTED to call iam:CreateRole when the
+# boundary is present, so a role without one fails at deploy time anyway. The
+# difference is the error: AWS says "AccessDenied on iam:CreateRole" and never
+# mentions boundaries, which is a slow thing to diagnose. This says it plainly,
+# before anything is sent to AWS.
+#
+rule every_role_has_a_permissions_boundary when %iam_roles !empty {
+    %iam_roles {
+        Properties.PermissionsBoundary exists
+        <<
+        violation: every IAM role must set PermissionsBoundary.
+            fix: PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/${OrgName}-platform-boundary'
+            why: without it a role can be created more privileged than the
+                 pipeline that creates it. The deploy would fail anyway, with
+                 an AccessDenied that does not mention boundaries.
+            note: roles generated from iam/roles/ always have this. If you are
+                  seeing it, the role was hand-written in a unit.
+        >>
+    }
+}
+
+
+#
+# NO INLINE POLICIES ON A ROLE.
+#
+# An inline policy cannot be listed on its own, reviewed on its own, or
+# attached to a second role. Ours are customer-managed so they can be reused
+# and so a reviewer can see one policy in one place.
+#
+# THE EXCEPTION IS bootstrap/, which is not linted by this pipeline: those
+# roles exist before there is anything to manage them with.
+#
+rule no_inline_policies_on_roles when %iam_roles !empty {
+    %iam_roles {
+        Properties.Policies not exists
+        <<
+        violation: IAM roles must not use inline Policies.
+            fix: add the document as a .json in iam/policies/ and name it in
+                 the role's iam/roles/*.yaml file instead.
+            why: an inline policy cannot be listed, reviewed on its own, or
+                 attached to anything else.
+        >>
+    }
+}
+
+rule no_standalone_inline_policy_resource when %inline_policy !empty {
+    %inline_policy {
+        Type != 'AWS::IAM::Policy'
+        <<
+        violation: AWS::IAM::Policy creates an INLINE policy.
+            fix: use AWS::IAM::ManagedPolicy, or add a .json to iam/policies/.
+            why: the name is misleading - AWS::IAM::Policy is the inline kind.
+                 AWS::IAM::ManagedPolicy is the reusable one.
+        >>
+    }
+}
+
+
+#
+# NO HUMAN CREDENTIALS, EVER.
+#
+# A role is bounded: it is assumed, it expires, and CloudTrail shows who
+# assumed it. An IAM user with an access key is none of those - the key is
+# long-lived, it outlives the stack that made it, and deleting the stack does
+# not revoke it.
+#
+# The execution role denies these outright, so this rule is the earlier and
+# clearer of the two failures.
+#
+rule no_iam_users when %iam_users !empty {
+    %iam_users {
+        Type != 'AWS::IAM::User'
+        <<
+        violation: this platform does not create IAM users.
+            fix: use a role. For a human, that is an Identity Center
+                 permission set, which is not managed from this repo.
+            why: an access key is long-lived and survives the stack that
+                 created it. stadion-cfn-execution-role denies this outright.
+        >>
+    }
+}
+
+rule no_access_keys when %iam_keys !empty {
+    %iam_keys {
+        Type != 'AWS::IAM::AccessKey'
+        <<
+        violation: this platform does not create access keys.
+            why: a long-lived credential in a template is a credential in
+                 CloudFormation state and in every copy of that state.
+        >>
+    }
+}

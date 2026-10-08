@@ -1,0 +1,24 @@
+# Force LF on everything that a shell, CloudFormation, or CodeBuild will read.
+#
+# Without this, Windows checkouts get CRLF and shell scripts break in confusing
+# ways: a trailing "\" followed by CR escapes the CR rather than the newline, so
+# line continuations silently stop working and the remaining tokens are executed
+# as a command. The symptom is an unrelated "command not found" partway through
+# a script that passes `bash -n`.
+
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.json    text eol=lf
+*.py      text eol=lf
+*.guard   text eol=lf
+*.md      text eol=lf
+Makefile  text eol=lf
+
+# Binary — never touch
+*.png     binary
+*.jpg     binary
+*.gz      binary
+*.zip     binary

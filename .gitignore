@@ -1,0 +1,55 @@
+# Fetched module artifact — NEVER commit this.
+# It is downloaded from S3 by ci/fetch-modules.sh at build time.
+# The only record of which version was used is `moduleVersion` in each config.
+modules/
+
+# Downloaded module tarballs, cached by ci/lib/modules.sh so a re-run does not
+# hit S3 again. Safe to delete at any time.
+.build/
+*.tar.gz
+
+# docs/STACK-REGISTRY.md IS COMMITTED, and is deliberately NOT listed here.
+#
+# It is generated, but it is also the catalogue people read to answer "what is
+# this stack called and what outputs can I consume?" - and a generated file
+# nobody can browse on GitHub answers that for nobody.
+#
+# It stays honest without a build gate:
+#   - ci/lint.sh REGENERATES it on every run, so anyone who lints picks the
+#     change up and sees it in `git status`
+#   - ci/buildspec.yml does NOT check it is current. It used to in the infra
+#     repo, and that gate failed three pipeline runs over a one-line
+#     documentation diff.
+#
+# A copy that is one commit behind is a readable catalogue. A gate that blocks
+# deploys over a stale table is not worth having, and the check that actually
+# matters - every Fn::GetStackOutput resolving - runs inside ci/lint.sh and
+# never needed a committed file at all.
+
+# NO GENERATED IAM TEMPLATES HERE YET.
+#
+# The infra repo ignores tier1-security/iam-policies/main.yaml and
+# tier1-security/iam-roles/main.yaml, because those are built from its iam/
+# folder by ci/gen-iam.py. This repo has neither. When app-scoped IAM roles
+# arrive, add the generated paths here at the same time as gen-iam.py - a
+# generated template that gets committed is a second place the same policy
+# lives, which is a second place it can be wrong.
+
+# cloudformation package output
+packaged.yaml
+*.packaged.yaml
+*.packaged.json
+
+# rendered parameter files
+.params/
+*.params.json
+
+# local
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.idea/
+.vscode/
+.code-workspace
